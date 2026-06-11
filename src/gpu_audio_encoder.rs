@@ -15,11 +15,9 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use burn::tensor::TensorData;
-
 use crate::config::AudioConfig;
 use crate::cudarc_engine::{
-    CpuTensor, CudaState, GpuTensor, GpuWeight, gpu_helpers,
+    CpuTensor, CudaState, GpuTensor, GpuWeight, WeightTensor, gpu_helpers,
 };
 
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
@@ -30,7 +28,7 @@ pub(crate) struct GpuLinear {
 }
 
 impl GpuLinear {
-    fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+    fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str) -> Result<Self> {
         let w = gpu_helpers::load_gpu_weight(cuda, weights, &format!("{}.weight", prefix))?;
         let bias = if weights.contains_key(&format!("{}.bias", prefix)) {
             Some(gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.bias", prefix))?)
@@ -56,7 +54,7 @@ pub(crate) struct GpuLayerNorm {
 }
 
 impl GpuLayerNorm {
-    fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str, eps: f32) -> Result<Self> {
+    fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str, eps: f32) -> Result<Self> {
         Ok(Self {
             w: gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.weight", prefix))?,
             bias: gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.bias", prefix))?,
@@ -80,7 +78,7 @@ struct GpuAudioAttention {
 }
 
 impl GpuAudioAttention {
-    fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str, nh: usize, dm: usize) -> Result<Self> {
+    fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str, nh: usize, dm: usize) -> Result<Self> {
         Ok(Self {
             q_proj: GpuLinear::load(cuda, weights, &format!("{}.q_proj", prefix))?,
             k_proj: GpuLinear::load(cuda, weights, &format!("{}.k_proj", prefix))?,
@@ -143,7 +141,7 @@ struct GpuAudioFfn {
 }
 
 impl GpuAudioFfn {
-    fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+    fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str) -> Result<Self> {
         Ok(Self {
             fc1: GpuLinear::load(cuda, weights, &format!("{}.fc1", prefix))?,
             fc2: GpuLinear::load(cuda, weights, &format!("{}.fc2", prefix))?,
@@ -166,7 +164,7 @@ struct GpuAudioLayer {
 }
 
 impl GpuAudioLayer {
-    fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str, nh: usize, dm: usize) -> Result<Self> {
+    fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str, nh: usize, dm: usize) -> Result<Self> {
         Ok(Self {
             sln: GpuLayerNorm::load(cuda, weights, &format!("{}.self_attn_layer_norm", prefix), 1e-5)?,
             attn: GpuAudioAttention::load(cuda, weights, &format!("{}.self_attn", prefix), nh, dm)?,
@@ -199,7 +197,7 @@ pub(crate) struct GpuConvStem {
 }
 
 impl GpuConvStem {
-    pub fn load(cuda: &CudaState, weights: &HashMap<String, TensorData>, prefix: &str, config: &AudioConfig) -> Result<Self> {
+    pub fn load(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, prefix: &str, config: &AudioConfig) -> Result<Self> {
         let c1_w = gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.conv2d1.weight", prefix))?;
         let c1_b = gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.conv2d1.bias", prefix))?;
         let c2_w = gpu_helpers::load_gpu_vec(cuda, weights, &format!("{}.conv2d2.weight", prefix))?;
@@ -298,7 +296,7 @@ pub(crate) struct GpuAudioEncoder {
 }
 
 impl GpuAudioEncoder {
-    pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, TensorData>, prefix: &str, config: &AudioConfig) -> Result<Self> {
+    pub fn load(cuda: Arc<CudaState>, weights: &HashMap<String, WeightTensor>, prefix: &str, config: &AudioConfig) -> Result<Self> {
         let dm = config.d_model;
         let nh = config.encoder_attention_heads;
         let mut layers = Vec::with_capacity(config.encoder_layers);
@@ -355,31 +353,4 @@ impl GpuAudioEncoder {
         let out_dim = out.shape[out.shape.len() - 1];
         Ok((out.data, out_dim))
     }
-
-    /// Run the transformer stack on pre-computed conv output [n_tokens, d_model].
-    /// Used when the conv stem runs on burn (legacy path).
-    pub fn run_transformer(&self, conv_out: &[f16], n_tokens: usize) -> Result<(Vec<f16>, usize)> {
-        let dm = self.config.d_model;
-
-        let h_cpu = CpuTensor::new(conv_out.to_vec(), vec![1, n_tokens, dm]);
-        let mut h = self.cuda.upload_tensor(&h_cpu)?;
-
-        for layer in &self.layers {
-            h = layer.forward(&self.cuda, h, None)?;   // <-- aligner: full attention
-        }
-
-        let h = self.ln_post.forward(&self.cuda, &h)?;
-        let mut h = self.proj1.forward(&self.cuda, &h)?;
-        self.cuda.gelu_inplace(&mut h)?;
-        let h = self.proj2.forward(&self.cuda, &h)?;
-
-        let out = self.cuda.download_tensor(&h)?;
-        let out_dim = out.shape[out.shape.len() - 1];
-        Ok((out.data, out_dim))
-    }
-}
-
-fn feo(ifr: usize) -> usize {
-    let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
-    f(f(f(ifr)))
 }

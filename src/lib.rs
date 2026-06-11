@@ -1,3 +1,10 @@
+//! Qwen3 forced aligner — CUDA-only (cudarc + hand-written kernels).
+//!
+//! The single inference path lives in `inference::AlignerInference::align`
+//! and dispatches every op (audio encoder, text decoder, MRoPE, lm_head
+//! gather, argmax) through `cudarc_engine` + `gpu_audio_encoder`.  No burn
+//! / candle / cubecl backend is used.
+
 pub mod config;
 pub mod mel;
 pub mod audio_io;
@@ -6,23 +13,10 @@ pub mod tokenizer;
 pub mod text;
 pub mod prompt;
 pub mod timestamp;
-pub mod encoder;
-pub mod decoder;
 pub mod inference;
 pub mod batch;
 
-#[cfg(feature = "cuda")]
 pub mod cudarc_engine;
-#[cfg(feature = "cuda")]
 pub mod gpu_audio_encoder;
 
 pub use inference::{AlignerInference, ForcedAlignItem, ForcedAlignResult, AlignRequest, AudioInput, TextInput};
-
-// ─── Backend / Device type aliases ─────────────────────────────────
-
-#[cfg(feature = "cuda")]
-pub type Backend = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime, half::f16, i32, u8>;
-#[cfg(feature = "cuda")]
-pub type Device = burn::backend::cuda::CudaDevice;
-#[cfg(feature = "cuda")]
-pub fn best_device() -> Device { Device::new(0) }

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Qwen forced aligner CLI (Burn backend).")]
+#[command(author, version, about = "Qwen forced aligner CLI (cudarc / CUDA).")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -43,16 +43,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Align { audio, text, model, language, output } => {
-            let device = qwen_aligner_rs::best_device();
-            let aligner = qwen_aligner_rs::AlignerInference::load(&model, device)?;
+            let aligner = qwen_aligner_rs::AlignerInference::load(&model)?;
             let result = aligner.align(qwen_aligner_rs::AlignRequest::from_paths(audio, text, language))?;
             qwen_aligner_rs::inference::write_forced_align_items_json(&output, &result.items)?;
             println!("align completed: words={}, output={}", result.items.len(), output.display());
         }
         Command::Batch { manifest, model, language, output_dir } => {
-            let device = qwen_aligner_rs::best_device();
             let jobs = qwen_aligner_rs::batch::load_manifest_jobs(&manifest, &output_dir, &language)?;
-            let aligner = qwen_aligner_rs::AlignerInference::load(&model, device)?;
+            let aligner = qwen_aligner_rs::AlignerInference::load(&model)?;
             let results = aligner.align_batch(jobs.iter().map(|j| j.request.clone()))?;
             for (job, result) in jobs.iter().zip(results.iter()) {
                 qwen_aligner_rs::inference::write_forced_align_items_json(&job.output, &result.items)

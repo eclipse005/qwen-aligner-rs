@@ -2,21 +2,18 @@
 name = "qwen-aligner-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Qwen3 forced aligner in Rust — word-level alignment using Burn backend (CUDA)"
+description = "Qwen3 forced aligner in Rust — cudarc CUDA backend with hand-written fused kernels."
 
 [[bin]]
 name = "qwen-aligner"
 path = "src/main.rs"
 
-[features]
-default = ["cuda"]
-cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl", "cubecl/cuda", "dep:cudarc"]
-
 [dependencies]
-burn = { version = "0.21", default-features = false, features = ["std"] }
-burn-cubecl = { version = "0.21", optional = true }
-cubecl = { version = "0.10", optional = true }
-cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc"], optional = true }
+# Direct CUDA driver bindings + cuBLAS + NVRTC.  All matmul/softmax/rmsnorm/
+# rotary/attention etc. is implemented either via cuBLAS HGEMM or via the
+# hand-written kernels in src/kernels/kernels.cu (NVRTC-compiled at runtime).
+# No deep-learning framework (burn / candle / tch) is on the inference path.
+cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc", "cuda-12080"] }
 half = "2"
 tokenizers = { version = "0.22", features = ["onig"] }
 serde = { version = "1", features = ["derive"] }

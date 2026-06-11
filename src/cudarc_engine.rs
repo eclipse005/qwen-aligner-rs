@@ -18,8 +18,23 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use burn::tensor::TensorData;
 use crate::config::TextConfig;
+
+/// Minimal CPU-side weight container: f32 data + shape.  Replaces burn's
+/// `TensorData` for our one use case (load safetensors → convert dtype to f32
+/// → upload to GPU as f16).  Keeps the dep tree off burn entirely.
+pub struct WeightTensor {
+    pub data: Vec<f32>,
+    pub shape: Vec<usize>,
+}
+
+impl WeightTensor {
+    pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
+        let expected: usize = shape.iter().product();
+        assert_eq!(data.len(), expected, "WeightTensor data len mismatch");
+        Self { data, shape }
+    }
+}
 
 const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
@@ -47,13 +62,11 @@ impl GpuTensor {
     pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn numel(&self) -> usize { self.data.len() }
     pub fn data(&self) -> &CudaSlice<f16> { &self.data }
-    pub fn data_mut(&mut self) -> &mut CudaSlice<f16> { &mut self.data }
     /// Reshape without moving data.
     pub fn reshape(&self, shape: Vec<usize>) -> Self {
         assert_eq!(self.data.len(), shape.iter().product::<usize>());
         Self { data: self.data.clone(), shape }
     }
-    pub fn into_parts(self) -> (CudaSlice<f16>, Vec<usize>) { (self.data, self.shape) }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -72,24 +85,17 @@ impl CpuTensor {
         assert_eq!(data.len(), expected, "CpuTensor len mismatch");
         Self { data, shape }
     }
-    pub fn reshape(&self, shape: Vec<usize>) -> Self {
-        assert_eq!(self.data.len(), shape.iter().product::<usize>());
-        Self { data: self.data.clone(), shape }
-    }
-    pub fn slice_first_dim(&self, start: usize, end: usize) -> Self {
-        assert!(end <= self.shape[0] && start <= end);
-        let row_size: usize = self.shape[1..].iter().product();
-        let mut s = self.shape.clone();
-        s[0] = end - start;
-        let base = start * row_size;
-        Self::new(self.data[base..base + (end - start) * row_size].to_vec(), s)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CudaState — context, stream, cuBLAS handle, kernel registry
 // ═══════════════════════════════════════════════════════════════════════
 
+// Some kernel slots are inherited from the ASR project's autoregressive
+// decode loop (single-token kv-cache writes, qkv split, rotary, etc.) and
+// aren't called by the aligner's pure-prefill pipeline.  They stay here so
+// the NVRTC kernels.cu source stays in sync with both projects.
+#[allow(dead_code)]
 pub(crate) struct CudaKernels {
     pub rms_norm: CudaFunction,
     pub add_residual_rms_norm: CudaFunction,
@@ -216,17 +222,7 @@ impl CudaState {
     pub fn alloc_uninit_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
         Ok(unsafe { self.stream.alloc::<f16>(n)? })
     }
-    pub fn alloc_zeros_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
-        Ok(self.stream.alloc_zeros::<i32>(n)?)
-    }
-    /// Allocate uninitialized i32 — same semantics as `alloc_uninit_f16`.
-    pub fn alloc_uninit_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
-        Ok(unsafe { self.stream.alloc::<i32>(n)? })
-    }
     pub fn download_f16(&self, slice: &CudaSlice<f16>) -> Result<Vec<f16>> {
-        Ok(self.stream.clone_dtoh(slice)?)
-    }
-    pub fn download_i32(&self, slice: &CudaSlice<i32>) -> Result<Vec<i32>> {
         Ok(self.stream.clone_dtoh(slice)?)
     }
 
@@ -242,13 +238,6 @@ impl CudaState {
     pub fn synchronize(&self) -> Result<()> {
         self.stream.synchronize()?;
         Ok(())
-    }
-
-    /// Device→device clone of a GpuTensor (one memcpy, no kernel launch).
-    pub fn clone_tensor(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        let mut out = self.alloc_uninit_f16(x.numel())?;
-        self.stream.memcpy_dtod(&x.data, &mut out)?;
-        Ok(GpuTensor::new(out, x.shape().to_vec()))
     }
 }
 
@@ -308,14 +297,6 @@ impl CudaState {
         Ok(())
     }
 
-    /// y = residual_in + x @ W^T  — copies residual_in into a fresh buffer then accumulates via cuBLAS beta=1.
-    /// One memcpy_dtod (no launch overhead) + one cuBLAS GEMM, vs separate clone + linear_gpu_accum
-    /// which has the same cost but two visible calls; this version just centralizes the pattern.
-    pub fn linear_residual(&self, residual_in: &GpuTensor, x: &GpuTensor, w: &GpuWeight) -> Result<GpuTensor> {
-        let mut y = self.clone_tensor(residual_in)?;
-        self.linear_gpu_accum(&mut y, x, w)?;
-        Ok(y)
-    }
 
     /// Scatter `audio[i] -> embeds[positions[i], :]` in place.  Aligner uses
     /// this to splice audio encoder outputs into the embedding table at the
@@ -345,7 +326,7 @@ impl CudaState {
     /// scores = Q @ K^T  (Q: [b,h,m,d], K: [b,h,n,d] → [b,h,m,n])
     pub fn attention_qk(&self, q: &GpuTensor, k: &GpuTensor) -> Result<GpuTensor> {
         let b = q.shape()[0]; let h = q.shape()[1]; let m = q.shape()[2]; let n = k.shape()[2];
-        let mut s = self.alloc_uninit_f16(b * h * m * n)?;
+        let s = self.alloc_uninit_f16(b * h * m * n)?;
         let mut s_t = GpuTensor::new(s, vec![b, h, m, n]);
         self.attention_qk_into(q, k, &mut s_t)?;
         Ok(s_t)
@@ -382,9 +363,9 @@ impl CudaState {
     /// out = attn @ V  (attn: [b,h,m,n], V: [b,h,n,d] → [b,h,m,d])
     pub fn attention_av(&self, attn: &GpuTensor, v: &GpuTensor) -> Result<GpuTensor> {
         let b = attn.shape()[0]; let h = attn.shape()[1];
-        let m = attn.shape()[2]; let n = attn.shape()[3];
+        let m = attn.shape()[2];
         let d = v.shape()[3];
-        let mut o = self.alloc_uninit_f16(b * h * m * d)?;
+        let o = self.alloc_uninit_f16(b * h * m * d)?;
         let mut o_t = GpuTensor::new(o, vec![b, h, m, d]);
         self.attention_av_into(attn, v, &mut o_t)?;
         Ok(o_t)
@@ -475,6 +456,7 @@ impl CudaState {
 
     /// Fused: residual += add_in (in-place), then out = rms_norm(residual, w).
     /// Saves one kernel launch vs separate `add` + `rms_norm`.
+    #[allow(dead_code)]  // ASR autoregressive decode path; aligner does pure prefill.
     pub fn add_residual_rms_norm(&self, residual: &mut GpuTensor, add_in: &GpuTensor, w: &CudaSlice<f16>, eps: f32) -> Result<GpuTensor> {
         let nd = residual.shape().len();
         let last = residual.shape()[nd - 1];
@@ -570,6 +552,7 @@ impl CudaState {
 
     /// Q/K rotary embedding. x [b, h, s, d], cos/sin [total_s, d] (full table).
     /// pos_offset is added to each `is` to index into cos/sin.
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn rotary_emb(&self, x: &GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>, pos_offset: usize) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 4);
@@ -587,6 +570,7 @@ impl CudaState {
 
     /// Fused per-head RMSNorm + rotary on Q or K. x [b, h, s, d].
     /// cos/sin: [total_s, d] (full table). pos_offset is added to each `is`.
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn rms_norm_rotary(&self, x: &GpuTensor, w: &CudaSlice<f16>,
                            cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
                            pos_offset: usize, eps: f32) -> Result<GpuTensor>
@@ -646,61 +630,6 @@ impl CudaState {
         Ok(GpuTensor::new(out, vec![n, d]))
     }
 
-    pub fn argmax(&self, x: &GpuTensor) -> Result<i32> {
-        let n = x.numel();
-        let mut out = self.alloc_uninit_i32(1)?;
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n_i = n as i32;
-        let mut bb = self.stream.launch_builder(&self.k.argmax);
-        bb.arg(&mut out); bb.arg(&x.data); bb.arg(&n_i);
-        unsafe { bb.launch(cfg) }?;
-        let v = self.download_i32(&out)?;
-        Ok(v[0])
-    }
-
-    /// Argmax that writes its result into `token_buf[slot]` (preallocated) instead of
-    /// allocating a fresh i32 each call.  Pair with `download_i32(token_buf)` to get the value.
-    pub fn argmax_into(&self, x: &GpuTensor, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
-        let n = x.numel();
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n_i = n as i32; let slot_i = slot as i32;
-        let mut bb = self.stream.launch_builder(&self.k.argmax_into_slot);
-        bb.arg(token_buf); bb.arg(&x.data); bb.arg(&n_i); bb.arg(&slot_i);
-        unsafe { bb.launch(cfg) }?;
-        Ok(())
-    }
-
-    /// Fused: y = hidden @ embed_table^T, then argmax(y).  Saves one alloc + one launch
-    /// vs separate `linear_gpu + argmax`, but our hand-written GEMV currently loses to cuBLAS
-    /// f16 GEMV on vocab-size 151936 by a large margin — kept for reference / future fusion work.
-    /// hidden: at least [hs] elements; embed_table: [vocab, hs] GpuWeight.
-    pub fn lm_head_argmax(&self, hidden: &GpuTensor, embed_table: &GpuWeight) -> Result<i32> {
-        let hs = embed_table.cols;
-        let vocab = embed_table.rows;
-        assert!(hidden.numel() >= hs, "lm_head_argmax: hidden too small");
-        let mut out = self.alloc_uninit_i32(1)?;
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let v_i = vocab as i32; let hs_i = hs as i32;
-        let mut bb = self.stream.launch_builder(&self.k.lm_head_gemv_argmax);
-        bb.arg(&mut out); bb.arg(&hidden.data); bb.arg(&embed_table.data);
-        bb.arg(&v_i); bb.arg(&hs_i);
-        unsafe { bb.launch(cfg) }?;
-        let v = self.download_i32(&out)?;
-        Ok(v[0])
-    }
-
     pub fn swap_dims_12(&self, x: &GpuTensor) -> Result<GpuTensor> {
         let s = x.shape();
         assert_eq!(s.len(), 4);
@@ -716,6 +645,7 @@ impl CudaState {
     }
 
     /// Extract one head-group from a fused QKV tensor in [b, h, s, d] layout.
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn qkv_split(&self, qkv: &GpuTensor, h: usize, d: usize, offset: usize) -> Result<GpuTensor> {
         let s = qkv.shape();
         assert_eq!(s.len(), 3);
@@ -734,6 +664,7 @@ impl CudaState {
 
     /// Fused: extract Q from fused QKV, apply RMSNorm + rotary in one launch.
     /// qkv: [b, s, q_dim + 2*kv_dim].  Returns Q: [b, nqh, s, d].
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn qkv_extract_q_norm_rotary(&self, qkv: &GpuTensor, qn_w: &CudaSlice<f16>,
         cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
         nqh: usize, d: usize, pos_offset: usize, eps: f32,
@@ -760,6 +691,7 @@ impl CudaState {
 
     /// Fused: extract K (with RMSNorm+rotary) and V (raw) from fused QKV, write both into KV cache.
     /// Replaces qkv_split×2 + rms_norm_rotary + kv_cache_write_pair (4 launches → 1).
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn qkv_extract_kv_norm_rotary_cache(&self,
         k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
         qkv: &GpuTensor, kn_w: &CudaSlice<f16>,
@@ -825,6 +757,7 @@ impl CudaState {
     }
 
     /// Write a [b, nkvh, s_new, d] tensor into a [b, nkvh, max_seq, d] cache at offset `start`.
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn kv_cache_write(&self, cache: &mut CudaSlice<f16>, k_new: &GpuTensor,
         b: usize, nkvh: usize, max_seq: usize, d: usize, start: usize,
     ) -> Result<()> {
@@ -842,6 +775,7 @@ impl CudaState {
     }
 
     /// Fused: write K and V into their caches in one kernel.
+    #[allow(dead_code)]  // ASR autoregressive decode path.
     pub fn kv_cache_write_pair(&self, k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
         k_new: &GpuTensor, v_new: &GpuTensor,
         b: usize, nkvh: usize, max_seq: usize, d: usize, start: usize,
@@ -1110,9 +1044,6 @@ pub(crate) struct GpuKvCache {
     pub v: Vec<CudaSlice<f16>>,
     pub cur_len: usize,
     pub max_seq: usize,
-    pub b: usize,
-    pub nkvh: usize,
-    pub d: usize,
 }
 
 impl GpuKvCache {
@@ -1123,7 +1054,7 @@ impl GpuKvCache {
             k.push(cuda.alloc_zeros_f16(b * nkvh * max_seq * d)?);
             v.push(cuda.alloc_zeros_f16(b * nkvh * max_seq * d)?);
         }
-        Ok(Self { k, v, cur_len: 0, max_seq, b, nkvh, d })
+        Ok(Self { k, v, cur_len: 0, max_seq })
     }
 }
 
@@ -1137,45 +1068,35 @@ impl GpuKvCache {
 
 pub(crate) mod gpu_helpers {
     use super::*;
-    pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<GpuWeight> {
+    pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<GpuWeight> {
         super::load_gpu_weight(cuda, weights, name)
     }
-    pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<CudaSlice<f16>> {
+    pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<CudaSlice<f16>> {
         super::load_gpu_vec(cuda, weights, name)
     }
 }
 
-fn get_weight_f16(weights: &HashMap<String, TensorData>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
+fn get_weight_f16(weights: &HashMap<String, WeightTensor>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
     let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
-    let shape = td.shape.to_vec();
-    let data_f16: Vec<f16> = match td.dtype {
-        burn::tensor::DType::F32 => td.to_vec::<f32>().map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?
-            .into_iter().map(f16::from_f32).collect(),
-        burn::tensor::DType::F16 => td.to_vec::<f16>().map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?,
-        _ => anyhow::bail!("unsupported dtype {:?} for {}", td.dtype, name),
-    };
+    let shape = td.shape.clone();
+    let data_f16: Vec<f16> = td.data.iter().map(|&v| f16::from_f32(v)).collect();
     Ok((data_f16, shape))
 }
 
-fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<GpuWeight> {
+fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<GpuWeight> {
     let (data_f16, shape) = get_weight_f16(weights, name)?;
     assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
     let dev = cuda.upload_f16(&data_f16)?;
     Ok(GpuWeight { data: dev, rows: shape[0], cols: shape[1] })
 }
 
-fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<CudaSlice<f16>> {
+fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<CudaSlice<f16>> {
     let (data_f16, _shape) = get_weight_f16(weights, name)?;
     cuda.upload_f16(&data_f16)
 }
 
-fn load_cpu_tensor(weights: &HashMap<String, TensorData>, name: &str) -> Result<CpuTensor> {
-    let (data_f16, shape) = get_weight_f16(weights, name)?;
-    Ok(CpuTensor::new(data_f16, shape))
-}
-
 fn load_fused_qkv_weight(
-    weights: &HashMap<String, TensorData>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, WeightTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize, usize)> {
     let (qw, qs) = get_weight_f16(weights, &format!("{}.q_proj.weight", prefix))?;
     let (kw, ks) = get_weight_f16(weights, &format!("{}.k_proj.weight", prefix))?;
@@ -1190,7 +1111,7 @@ fn load_fused_qkv_weight(
 }
 
 fn load_fused_gate_up_weight(
-    weights: &HashMap<String, TensorData>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, WeightTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize)> {
     let (gw, gs) = get_weight_f16(weights, &format!("{}.gate_proj.weight", prefix))?;
     let (uw, us) = get_weight_f16(weights, &format!("{}.up_proj.weight", prefix))?;
@@ -1219,7 +1140,7 @@ struct GpuDecoderLayer {
 }
 
 impl GpuDecoderLayer {
-    fn load(w: &HashMap<String, TensorData>, p: &str, cfg: &TextConfig, cuda: &CudaState) -> Result<Self> {
+    fn load(w: &HashMap<String, WeightTensor>, p: &str, cfg: &TextConfig, cuda: &CudaState) -> Result<Self> {
         Ok(Self {
             iln_w: load_gpu_vec(cuda, w, &format!("{}.input_layernorm.weight", p))?,
             pln_w: load_gpu_vec(cuda, w, &format!("{}.post_attention_layernorm.weight", p))?,
@@ -1376,12 +1297,11 @@ pub(crate) struct GpuTextDecoder {
     layers: Vec<GpuDecoderLayer>,
     pub norm_w: CudaSlice<f16>,            // [hidden]
     pub eps: f32,
-    pub config: TextConfig,
     pub cuda: Arc<CudaState>,
 }
 
 impl GpuTextDecoder {
-    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, TensorData>, prefix: &str, config: &TextConfig) -> Result<Self> {
+    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, WeightTensor>, prefix: &str, config: &TextConfig) -> Result<Self> {
         let (embed_f16, embed_shape) = get_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
         let embed_dev = cuda.upload_f16(&embed_f16)?;
         let embed_table = GpuWeight { data: embed_dev, rows: embed_shape[0], cols: embed_shape[1] };
@@ -1397,37 +1317,7 @@ impl GpuTextDecoder {
             layers.push(GpuDecoderLayer::load(weights, &format!("{}.layers.{}", prefix, i), config, &cuda)?);
         }
 
-        Ok(Self { embed_table, lm_head, layers, norm_w, eps: config.rms_norm_eps as f32, config: config.clone(), cuda })
-    }
-
-    pub fn load(weights: &HashMap<String, TensorData>, prefix: &str, config: &TextConfig) -> Result<Self> {
-        let cuda = Arc::new(CudaState::new(0)?);
-        Self::load_with(cuda, weights, prefix, config)
-    }
-
-    pub fn embed_ids(&self, ids: &[i64]) -> Result<GpuTensor> {
-        let ids_gpu = self.cuda.upload_i64(ids)?;
-        self.cuda.embed_lookup(&self.embed_table, &ids_gpu)
-    }
-
-    /// Single-token embed lookup whose id sits in a pre-allocated GPU i32 buffer.
-    /// Saves the htod upload + temporary alloc that `embed_ids(&[tok])` does each step
-    /// in the decode hot loop.  Returns shape [1, 1, hidden].
-    pub fn embed_id_from_gpu_slot(&self, token_buf: &CudaSlice<i32>, slot: usize) -> Result<GpuTensor> {
-        let d = self.embed_table.cols;
-        let mut out = self.cuda.alloc_uninit_f16(d)?;
-        let bs = (d as u32).min(1024);
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (bs, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let slot_i = slot as i32; let d_i = d as i32;
-        let mut bb = self.cuda.stream.launch_builder(&self.cuda.k.embed_lookup_single_i32);
-        bb.arg(&mut out); bb.arg(&self.embed_table.data); bb.arg(token_buf);
-        bb.arg(&slot_i); bb.arg(&d_i);
-        unsafe { bb.launch(cfg) }?;
-        Ok(GpuTensor::new(out, vec![1, 1, d]))
+        Ok(Self { embed_table, lm_head, layers, norm_w, eps: config.rms_norm_eps as f32, cuda })
     }
 
     /// Forward pass.
@@ -1471,26 +1361,6 @@ impl GpuTextDecoder {
 
         // LM head — INDEPENDENT weight (thinker.lm_head.weight), not shared with embed_tokens
         self.cuda.linear_gpu(&h, &self.lm_head)
-    }
-
-    /// Same as `forward` but for the **decode** path: runs all layers, final RMSNorm, then
-    /// the fused lm_head GEMV + argmax kernel in one launch, returning the next token id.
-    /// Saves one large alloc + one big linear_gpu + one separate argmax — used in the hot
-    /// decode loop where every microsecond matters.
-    pub fn forward_decode_argmax(&self, hs: GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
-                                 kv: &mut GpuKvCache, kv_start: usize) -> Result<i32>
-    {
-        let sl = hs.shape()[1];
-        let mut h = hs;
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(h, cos, sin, kv, i, kv_start, false, &self.cuda)?;
-        }
-        kv.cur_len = kv_start + sl;
-
-        let h = self.cuda.rms_norm(&h, &self.norm_w, self.eps)?;
-        // h shape: [1, sl, hidden]; for decode sl==1, the row is contiguous at offset 0.
-        // For prefill calling this method we'd need to slice last; decode path uses sl==1 so skip.
-        self.cuda.lm_head_argmax(&h, &self.lm_head)
     }
 
     fn slice_last_token(&self, h: &GpuTensor) -> Result<GpuTensor> {

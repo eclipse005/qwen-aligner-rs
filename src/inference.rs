@@ -1,5 +1,9 @@
+//! Cudarc-only inference: audio encoder + 28-layer text decoder + lm_head
+//! all run through `cudarc_engine` and `gpu_audio_encoder`.  No burn / candle
+//! tensors are allocated on the hot path.  Weight tensors load directly from
+//! safetensors into f16 device memory.
+
 use anyhow::Context;
-use burn::tensor::{Int, Tensor, TensorData};
 use half::f16;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -9,21 +13,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::AlignerConfig;
-use crate::decoder::{compute_mrope_cos_sin, extract_timestamp_logits, TextDecoder};
-use crate::encoder::AudioEncoder;
-use crate::mel::extract_log_mel_features;
-use crate::{Backend, Device};
-
-#[cfg(feature = "cuda")]
-use crate::cudarc_engine::{CudaState, CpuTensor};
-#[cfg(feature = "cuda")]
+use crate::cudarc_engine::{
+    compute_mrope_cos_sin, CudaState, GpuKvCache, GpuTensor, GpuTextDecoder, GpuWeight, WeightTensor,
+};
 use crate::gpu_audio_encoder::GpuAudioEncoder;
-#[cfg(feature = "cuda")]
-use cudarc::driver::CudaSlice;
-#[cfg(feature = "cuda")]
-type F16Slice = CudaSlice<f16>;
+use crate::mel::extract_log_mel_features;
 
-const _AUDIO_PAD_TOKEN: &str = "<|video_pad|>";
 const F16_TIMESTAMP_ARGMAX_TIE_EPS: f32 = 1.0 / 256.0;
 
 // ─── Public types ──────────────────────────────────────────────────
@@ -79,33 +74,17 @@ impl AlignRequest {
 // ─── Inference engine ──────────────────────────────────────────────
 
 pub struct AlignerInference {
-    /// Burn-side audio encoder.  Only used in the non-cuda build or when
-    /// cudarc init fails.  On the cudarc path the cudarc engine owns the
-    /// model and this is None, saving ~600MB of GPU memory.
-    audio_encoder: Option<AudioEncoder<Backend>>,
-    text_decoder: Option<TextDecoder<Backend>>,
     config: AlignerConfig,
     tokenizer: crate::tokenizer::QwenTokenizer,
-    device: Device,
-    /// Optional cudarc audio encoder (Step 2+). When present, the inference
-    /// pipeline uses it instead of the burn `AudioEncoder` for the conv-stem +
-    /// transformer forward pass.  Loaded eagerly so we fail fast on cudarc
-    /// errors and so the cudarc state stays resident for repeat calls.
-    #[cfg(feature = "cuda")]
-    gpu_audio_encoder: Option<Arc<GpuAudioEncoder>>,
-    #[cfg(feature = "cuda")]
-    cuda_state: Option<Arc<CudaState>>,
-    /// cudarc text decoder (Step 3+).  Mirrors the burn `TextDecoder` but
-    /// dispatches fused cuBLAS+CUDA kernels for every op (no burn tensor
-    /// allocations, no .clone()/slice/cat on the hot path).
-    #[cfg(feature = "cuda")]
-    gpu_text_decoder: Option<Arc<crate::cudarc_engine::GpuTextDecoder>>,
+    cuda: Arc<CudaState>,
+    gpu_audio_encoder: Arc<GpuAudioEncoder>,
+    gpu_text_decoder: Arc<GpuTextDecoder>,
 }
 
 unsafe impl Send for AlignerInference {}
 
 impl AlignerInference {
-    pub fn load(model_dir: &Path, device: Device) -> anyhow::Result<Self> {
+    pub fn load(model_dir: &Path) -> anyhow::Result<Self> {
         info!("Loading config...");
         let config = AlignerConfig::from_file(&model_dir.join("config.json"))
             .context("load config")?;
@@ -117,54 +96,23 @@ impl AlignerInference {
         info!("Loading tokenizer...");
         let tokenizer = crate::tokenizer::load_qwen_tokenizer(model_dir)?;
 
-        // Step 3+: when cudarc is available, skip uploading weights to the burn
-        // backend entirely.  This saves ~600MB of GPU memory (f16 model weights
-        // held on the device) and is essential for fitting long-audio KV caches
-        // on the 8GB P104-100.
-        //
-        // The cudarc build's `align_waveform_text` always dispatches to
-        // `align_cudarc`, so the burn-side encoder/decoder fields are unused
-        // and stay None.
-        #[cfg(feature = "cuda")]
-        let (audio_encoder, text_decoder): (Option<AudioEncoder<Backend>>, Option<TextDecoder<Backend>>) = (None, None);
-
-        #[cfg(not(feature = "cuda"))]
-        let (audio_encoder, text_decoder) = {
-            info!("Loading audio encoder (burn)...");
-            let ae = AudioEncoder::load(
-                &weight_data, "thinker.audio_tower",
-                &config.thinker_config.audio_config, &device,
-            ).context("load audio encoder")?;
-            info!("Loading text decoder (burn)...");
-            let td = TextDecoder::load(
-                &weight_data, "thinker.model",
-                &config.thinker_config.text_config, &device,
-            ).context("load text decoder")?;
-            (Some(ae), Some(td))
-        };
-
-        // ─── cudarc engine (used for the GpuAudioEncoder + GpuTextDecoder) ───
-        #[cfg(feature = "cuda")]
-        let (gpu_audio_encoder, cuda_state, gpu_text_decoder) = {
-            info!("Initialising cudarc engine for GPU encoders + decoder...");
-            let cuda = Arc::new(CudaState::new(0).context("cudarc init")?);
-            let gpu_ae = GpuAudioEncoder::load(
-                cuda.clone(), &weight_data, "thinker.audio_tower",
-                &config.thinker_config.audio_config,
-            ).context("load cudarc audio encoder")?;
-            let gpu_td = crate::cudarc_engine::GpuTextDecoder::load_with(
-                cuda.clone(), &weight_data, "thinker.model",
-                &config.thinker_config.text_config,
-            ).context("load cudarc text decoder")?;
-            (Some(Arc::new(gpu_ae)), Some(cuda), Some(Arc::new(gpu_td)))
-        };
+        info!("Initialising cudarc engine for GPU encoders + decoder...");
+        let cuda = Arc::new(CudaState::new(0).context("cudarc init")?);
+        let gpu_ae = GpuAudioEncoder::load(
+            cuda.clone(), &weight_data, "thinker.audio_tower",
+            &config.thinker_config.audio_config,
+        ).context("load cudarc audio encoder")?;
+        let gpu_td = GpuTextDecoder::load_with(
+            cuda.clone(), &weight_data, "thinker.model",
+            &config.thinker_config.text_config,
+        ).context("load cudarc text decoder")?;
 
         info!("Model loaded successfully.");
         Ok(Self {
-            audio_encoder, text_decoder, config, tokenizer, device,
-            #[cfg(feature = "cuda")] gpu_audio_encoder,
-            #[cfg(feature = "cuda")] cuda_state,
-            #[cfg(feature = "cuda")] gpu_text_decoder,
+            config, tokenizer,
+            cuda,
+            gpu_audio_encoder: Arc::new(gpu_ae),
+            gpu_text_decoder: Arc::new(gpu_td),
         })
     }
 
@@ -189,194 +137,10 @@ impl AlignerInference {
     }
 
     fn align_waveform_text(&self, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<ForcedAlignResult> {
-        // Step 3+: cudarc text decoder path.  When the cudarc decoder is loaded,
-        // dispatch the full forward pass (embed → MRoPE → 28 layers → lm_head →
-        // timestamp gather → argmax) entirely through fused cuBLAS+CUDA kernels
-        // with no burn tensor allocations in the hot path.
-        #[cfg(feature = "cuda")]
-        if self.gpu_text_decoder.is_some() && self.gpu_audio_encoder.is_some() && self.cuda_state.is_some() {
-            return self.align_cudarc(waveform, text, language);
-        }
-
         let mut profile = Profile::new();
-
-        // 1. Text tokenization
-        let (words, aligner_input) = crate::text::encode_timestamp(text, language)?;
-
-        // 2. Mel feature extraction
-        let features = extract_log_mel_features(waveform)?;
-        profile.mark("prepare_input");
-
-        // 3. Audio pad expansion
-        let audio_pad_count = crate::prompt::feature_extract_output_len(features.frames as i64);
-        let expanded_input = crate::prompt::expand_audio_pad_once(&aligner_input, audio_pad_count as usize)?;
-
-        // 4. Tokenize
-        let input_ids_u32 = crate::tokenizer::encode_to_ids(&self.tokenizer, &expanded_input)?;
-        let input_ids: Vec<i64> = input_ids_u32.into_iter().map(i64::from).collect();
-
-        // 5. Find timestamp positions
-        let timestamp_token_id = self.config.timestamp_token_id as i64;
-        let timestamp_positions: Vec<usize> = input_ids.iter().enumerate()
-            .filter_map(|(i, &id)| if id == timestamp_token_id { Some(i) } else { None })
-            .collect();
-        profile.mark("tokenize");
-
-        // 6. Audio encoder
-        //    Step 2+ uses the cudarc path: pack mel into [b_chunks, 1, n_mels, cs] f16
-        //    chunks, run the GpuAudioEncoder (conv stem + 24 transformer layers +
-        //    ln_post + proj1 + gelu + proj2), and download the result.
-        let audio_cfg = &self.config.thinker_config.audio_config;
-        let n_window = audio_cfg.n_window;
-        let cs = n_window * 2;
-        let n_mels = audio_cfg.num_mel_bins;
-        let nf = features.frames;
-        let nfull = nf / cs;
-        let tail = nf % cs;
-        let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
-
-        // chunk_tokens[i] = how many conv-stem output tokens this chunk contributes
-        // (full chunks → tpc; tail → feo(tail)).
-        let tpc = AudioEncoder::<Backend>::feo(cs);
-        let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
-        for _ in 0..nfull { chunk_tokens.push(tpc); }
-        if tail > 0 { chunk_tokens.push(AudioEncoder::<Backend>::feo(tail)); }
-
-        // Pack mel into cudarc conv-stem layout: for each chunk, write
-        // output[(chunk * n_mels + mel) * cs + t] = input[mel * nf + chunk*cs + t]
-        // (zero-padding the tail chunk).  Same layout as asr-burn's build_padded_chunks.
-        let mut mel_packed: Vec<f16> = vec![f16::ZERO; n_chunks * n_mels * cs];
-        for chunk in 0..n_chunks {
-            let start = chunk * cs;
-            let len = cs.min(nf.saturating_sub(start));
-            for mel in 0..n_mels {
-                for t in 0..len {
-                    let src = mel * nf + start + t;
-                    let dst = (chunk * n_mels + mel) * cs + t;
-                    mel_packed[dst] = f16::from_f32(features.values[src]);
-                }
-            }
-        }
-
-        let (audio_embeds_data, _out_dim, n_audio_tokens) = if let (Some(gpu_ae), Some(_cuda)) = (self.gpu_audio_encoder.as_ref(), self.cuda_state.as_ref()) {
-            // ── cudarc path ──
-            let (data, out_dim) = gpu_ae.run(&mel_packed, n_chunks, n_mels, cs, &chunk_tokens)
-                .context("cudarc audio encoder")?;
-            let n_total: usize = chunk_tokens.iter().sum();
-            (data, out_dim, n_total)
-        } else {
-            // ── burn fallback (no cuda feature, or cudarc failed) ──
-            let mel_tensor = Tensor::<Backend, 2>::from_data(
-                TensorData::new(features.values.clone(), [features.mel_bins, features.frames]),
-                &self.device,
-            );
-            let audio_embeds_tensor = self.audio_encoder.as_ref().expect("burn audio encoder").forward(&mel_tensor)?;
-            let dims = audio_embeds_tensor.dims();
-            let td = audio_embeds_tensor.into_data();
-            // f16 if backend default, else f32
-            let data: Vec<f16> = match td.to_vec::<f16>() {
-                Ok(v) => v,
-                Err(_) => td.to_vec::<f32>().unwrap().into_iter().map(f16::from_f32).collect(),
-            };
-            (data, dims[1], dims[0])
-        };
-        profile.mark("audio_encoder");
-
-        // 7. Embedding merge
-        if n_audio_tokens != audio_pad_count as usize {
-            anyhow::bail!(
-                "audio feature/token count mismatch: features={} placeholders={}",
-                n_audio_tokens, audio_pad_count,
-            );
-        }
-
-        let audio_token_id = self.config.thinker_config.audio_token_id;
-        let hidden_size = self.config.thinker_config.text_config.hidden_size;
-        let seq_len = input_ids.len();
-
-        // Embed all input_ids
-        let ids_tensor = Tensor::<Backend, 1, Int>::from_data(
-            TensorData::new(input_ids.iter().map(|&id| id as i32).collect::<Vec<_>>(), [seq_len]),
-            &self.device,
-        );
-        let embeds = self.text_decoder.as_ref().expect("burn text decoder").embed(&ids_tensor); // [seq_len, hidden]
-
-        // Download embeddings, replace audio positions with audio features, re-upload.
-        // audio_embeds_data is f16 (cudarc path) or f32-then-cast (burn path); both end up
-        // as f16 in `embed_vals` to match the burn backend's default f16 storage.
-        let embed_data = embeds.into_data();
-        let mut embed_vals: Vec<f16> = embed_data.to_vec::<f16>().unwrap_or_else(|_| {
-            embed_data.to_vec::<f32>().expect("embed dtype")
-                .into_iter().map(f16::from_f32).collect()
-        });
-
-        let mut audio_idx = 0usize;
-        for (tok_idx, &tok_id) in input_ids.iter().enumerate() {
-            if tok_id == audio_token_id as i64 {
-                let dst = tok_idx * hidden_size;
-                let src = audio_idx * hidden_size;
-                for j in 0..hidden_size {
-                    // audio_embeds is already f16; the f16→f32→f16 round-trip
-                    // here matches what the previous burn path did, preserving
-                    // bit-exact equivalence with the candle baseline.
-                    embed_vals[dst + j] = f16::from_f32(audio_embeds_data[src + j].to_f32());
-                }
-                audio_idx += 1;
-            }
-        }
-
-        let inputs_embeds = Tensor::<Backend, 3>::from_data(
-            TensorData::new(embed_vals, [1, seq_len, hidden_size]),
-            &self.device,
-        );
-        profile.mark("merge_embeddings");
-
-        // 8. MRoPE computation
-        let text_cfg = &self.config.thinker_config.text_config;
-        let all_pos: Vec<i64> = (0..seq_len as i64).collect();
-        let pos_3d: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
-        let (cos, sin) = compute_mrope_cos_sin(
-            &pos_3d, text_cfg.head_dim, text_cfg.rope_theta,
-            &text_cfg.mrope_section(), text_cfg.mrope_interleaved(),
-            &self.device,
-        );
-        profile.mark("rope_compute");
-
-        // 9. Text decoder (single forward pass)
-        let hidden_states = self.text_decoder.as_ref().expect("burn text decoder").forward_hidden(&inputs_embeds, &cos, &sin);
-        profile.mark("text_decoder");
-
-        // 10. Timestamp logits extraction
-        let td = self.text_decoder.as_ref().expect("burn text decoder");
-        let (logits, _n_timestamps, classify_num) = extract_timestamp_logits(
-            &hidden_states, &timestamp_positions,
-            &td.norm, &td.lm_head,
-        );
-        profile.mark("timestamp_logits");
-
-        // 11. Argmax with f16 tie-breaking
-        let output_ids = argmax_rows(&logits, classify_num);
-
-        // 12. Timestamp fix
-        let result = timestamp_ids_to_run(&words, &output_ids, self.config.timestamp_segment_time)?;
-        profile.mark("total");
-
-        Ok(result)
-    }
-
-    /// Step 3+: full cudarc inference pipeline.  Audio encoder already uses
-    /// `gpu_audio_encoder`; here we also run the 28-layer text decoder, MRoPE,
-    /// and the timestamp-head argmax entirely on the GPU.
-    #[cfg(feature = "cuda")]
-    fn align_cudarc(&self, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<ForcedAlignResult> {
-        use crate::cudarc_engine::{
-            compute_mrope_cos_sin as cudarc_mrope, CpuTensor, GpuKvCache,
-        };
-        let mut profile = Profile::new();
-
-        let cuda = self.cuda_state.as_ref().expect("cudarc engine");
-        let gpu_td = self.gpu_text_decoder.as_ref().expect("cudarc decoder");
-        let gpu_ae = self.gpu_audio_encoder.as_ref().expect("cudarc audio encoder");
+        let cuda = &self.cuda;
+        let gpu_td = &self.gpu_text_decoder;
+        let gpu_ae = &self.gpu_audio_encoder;
 
         // 1. Text tokenization (CPU)
         let (words, aligner_input) = crate::text::encode_timestamp(text, language)?;
@@ -406,12 +170,13 @@ impl AlignerInference {
         let nfull = nf / cs;
         let tail = nf % cs;
         let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
-        let tpc = AudioEncoder::<Backend>::feo(cs);
+        let tpc = conv_stem_output_len(cs);
         let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
         for _ in 0..nfull { chunk_tokens.push(tpc); }
-        if tail > 0 { chunk_tokens.push(AudioEncoder::<Backend>::feo(tail)); }
+        if tail > 0 { chunk_tokens.push(conv_stem_output_len(tail)); }
 
-        // Pack mel into cudarc conv-stem layout (f16).
+        // Pack mel into cudarc conv-stem layout (f16):
+        //   output[(chunk * n_mels + mel) * cs + t] = features[mel * nf + chunk*cs + t]
         let mut mel_packed: Vec<f16> = vec![f16::ZERO; n_chunks * n_mels * cs];
         for chunk in 0..n_chunks {
             let start = chunk * cs;
@@ -424,11 +189,10 @@ impl AlignerInference {
                 }
             }
         }
-        let (audio_embeds_data, _out_dim, n_audio_tokens) = {
-            let (data, out_dim) = gpu_ae.run(&mel_packed, n_chunks, n_mels, cs, &chunk_tokens)?;
-            let n_total: usize = chunk_tokens.iter().sum();
-            (data, out_dim, n_total)
-        };
+        let (audio_embeds_data, _out_dim) =
+            gpu_ae.run(&mel_packed, n_chunks, n_mels, cs, &chunk_tokens)
+                .context("cudarc audio encoder")?;
+        let n_audio_tokens: usize = chunk_tokens.iter().sum();
         profile.mark("audio_encoder");
 
         if n_audio_tokens != audio_pad_count as usize {
@@ -436,34 +200,27 @@ impl AlignerInference {
                 n_audio_tokens, audio_pad_count);
         }
 
-        // 7. Embedding merge (GPU-side, no CPU detour) ────────
-        // Step 4: replace CPU-side scatter with two GPU ops:
-        //   a) embed_lookup on GPU (returns GpuTensor)
-        //   b) scatter_audio_rows: splice audio_embeds into the audio token
-        //      positions directly on the device.
+        // 7. Embedding merge (entirely GPU-side) ────────
+        // a) embed_lookup gives us text embeddings on the GPU.
+        // b) scatter_audio_rows splices the audio_embeds into the audio_token
+        //    rows of the same buffer — no CPU detour.
         let audio_token_id = self.config.thinker_config.audio_token_id;
         let hidden_size = self.config.thinker_config.text_config.hidden_size;
         let seq_len = input_ids.len();
 
-        // a) Embed lookup on GPU.
-        let ids_dev = cuda.upload_i64(&input_ids.iter().map(|&x| x).collect::<Vec<_>>())?;
+        let ids_dev = cuda.upload_i64(&input_ids)?;
         let mut embeds_gpu = cuda.embed_lookup(&gpu_td.embed_table, &ids_dev)?;
         // embeds_gpu shape: [seq_len, hidden]
 
-        // b) Build the audio_token position list (in input_ids order).
-        //    Upload audio_embeds_data to GPU and scatter.
         let audio_positions: Vec<i32> = input_ids.iter().enumerate()
             .filter_map(|(i, &id)| if id == audio_token_id as i64 { Some(i as i32) } else { None })
             .collect();
         assert_eq!(audio_positions.len(), n_audio_tokens);
         let audio_pos_dev = cuda.stream.clone_htod(&audio_positions)?;
         let audio_embeds_dev = cuda.upload_f16(&audio_embeds_data)?;
-        let audio_embeds_tensor = crate::cudarc_engine::GpuTensor::new(
+        let audio_embeds_tensor = GpuTensor::new(
             audio_embeds_dev, vec![n_audio_tokens, hidden_size]
         );
-        // embeds_gpu is currently [seq_len, hidden] but GpuTensor is conceptually
-        // a 3D wrapper.  Reshape to [1, seq_len, hidden] then back to [seq_len, hidden]
-        // is a no-op (just a shape metadata change), so we can call scatter directly.
         cuda.scatter_audio_rows(&mut embeds_gpu, &audio_embeds_tensor, &audio_pos_dev)?;
 
         // Wrap as [1, seq_len, hidden] for the decoder.
@@ -474,46 +231,35 @@ impl AlignerInference {
         let text_cfg = &self.config.thinker_config.text_config;
         let all_pos: Vec<i64> = (0..seq_len as i64).collect();
         let pos_3d: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
-        let (cos_cpu, sin_cpu) = cudarc_mrope(
+        let (cos_cpu, sin_cpu) = compute_mrope_cos_sin(
             &pos_3d, text_cfg.head_dim, text_cfg.rope_theta,
             &text_cfg.mrope_section(), text_cfg.mrope_interleaved(),
         );
-        // cudarc_engine's compute_mrope_cos_sin returns CpuTensor, but
-        // GpuDecoderLayer expects &[CudaSlice<f16>] for cos/sin.  We re-upload.
         let cos_dev = cuda.upload_f16(&cos_cpu.data)?;
         let sin_dev = cuda.upload_f16(&sin_cpu.data)?;
         profile.mark("rope_compute");
 
         // 9. 28-layer text decoder forward (cudarc) ──────────────
-        // For aligner: use_causal=true; kv_start=0 (full prefill).
-        // max_seq must be >= seq_len so the KV cache can hold the full sequence.
-        // Aligner 180s audio: seq_len=4567.  KV cache is 28×8×128×max_seq×2×2 bytes
-        // (≤ 524MB for seq_len=4567).  P104-100 8GB has ~3GB headroom after
-        // cudarc uploads, so we can hold 4567 + 64 padding.
+        // For aligner: full prefill, causal mask, no chunked decode.
+        // max_seq = seq_len + 64 (tight; KV cache is 28 × 8 × 128 × max_seq × 2 × 2 bytes).
         let max_seq: usize = seq_len + 64;
         let nkvh = text_cfg.num_key_value_heads;
         let hd = text_cfg.head_dim;
         let mut kv = GpuKvCache::new(cuda, text_cfg.num_hidden_layers, 1, nkvh, max_seq, hd)?;
-        // GpuTextDecoder::forward runs the 28 transformer layers + final RMSNorm + lm_head
-        // in one call.  Output shape: [1, seq_len, classify_num] (= 5000 for aligner).
         let logits_full = gpu_td.forward(inputs_embeds_gpu, &cos_dev, &sin_dev, &mut kv, 0, true, false)?;
-        // Force sync so the `text_decoder` profile time reflects actual GPU work,
+        // Force sync so the `text_decoder` profile time reflects real GPU work,
         // not just kernel-submit time.  Without this, downstream calls (which
-        // do a sync via cudaMemcpy) appear to eat all the time, while the
-        // 28-layer decoder and lm_head GEMM (the real heavy work) hide in
-        // the gap.
+        // do a sync via cudaMemcpy) appear to eat all the time.
         cuda.synchronize()?;
         profile.mark("text_decoder");
 
-        // 10. Gather timestamp logits from the [1, seq_len, classify_num] tensor.
-        //     Use cuda.embed_lookup with logits_full as a 2D weight matrix
-        //     (rows=seq_len, cols=classify_num) to gather rows at the timestamp positions.
+        // 10. Gather timestamp logits from [1, seq_len, classify_num] via
+        //     embed_lookup (treating logits as a row table indexed by position).
         let logits_2d = logits_full.reshape(vec![seq_len, logits_full.shape()[2]]);
         let ts_indices: Vec<i64> = timestamp_positions.iter().map(|&p| p as i64).collect();
         let ts_indices_dev = cuda.upload_i64(&ts_indices)?;
-        let n_pos = timestamp_positions.len();
         let classify_num = logits_2d.shape()[1];
-        let logits_gathered = cuda.embed_lookup(&crate::cudarc_engine::GpuWeight {
+        let logits_gathered = cuda.embed_lookup(&GpuWeight {
             data: logits_2d.data().clone(),
             rows: seq_len,
             cols: classify_num,
@@ -535,7 +281,12 @@ impl AlignerInference {
 
 // ─── Helpers ───────────────────────────────────────────────────────
 
-fn to_f16_f32(v: f32) -> f32 { f16::from_f32(v).to_f32() }
+/// Audio conv-stem output token count for an input window of `ifr` mel frames.
+/// Three stride-2 convs, each shrinking length via `(l - 1) / 2 + 1`.
+fn conv_stem_output_len(ifr: usize) -> usize {
+    let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
+    f(f(f(ifr)))
+}
 
 pub(crate) fn argmax_rows(values: &[f32], cols: usize) -> Vec<i64> {
     values.chunks(cols).map(|row| {
@@ -585,7 +336,7 @@ pub fn write_forced_align_items_json(output: &Path, items: &[ForcedAlignItem]) -
 
 // ─── Weight loading ────────────────────────────────────────────────
 
-fn load_weights(model_dir: &Path) -> anyhow::Result<HashMap<String, TensorData>> {
+fn load_weights(model_dir: &Path) -> anyhow::Result<HashMap<String, WeightTensor>> {
     let index_path = model_dir.join("model.safetensors.index.json");
     if index_path.exists() {
         let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
@@ -600,7 +351,7 @@ fn load_weights(model_dir: &Path) -> anyhow::Result<HashMap<String, TensorData>>
     load_safetensors_file(&model_dir.join("model.safetensors"))
 }
 
-fn load_safetensors_file(path: &Path) -> anyhow::Result<HashMap<String, TensorData>> {
+fn load_safetensors_file(path: &Path) -> anyhow::Result<HashMap<String, WeightTensor>> {
     let buf = std::fs::read(path)?;
     let st = safetensors::SafeTensors::deserialize(&buf)
         .map_err(|e| anyhow::anyhow!("safetensors: {}", e))?;
@@ -625,7 +376,7 @@ fn load_safetensors_file(path: &Path) -> anyhow::Result<HashMap<String, TensorDa
             }).collect(),
             other => anyhow::bail!("unsupported dtype: {:?} in {}", other, name),
         };
-        weights.insert(name.to_string(), TensorData::new(f32_data, shape));
+        weights.insert(name.to_string(), WeightTensor::new(f32_data, shape));
     }
     Ok(weights)
 }
