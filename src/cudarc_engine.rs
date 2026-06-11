@@ -32,6 +32,12 @@ pub(crate) struct GpuTensor {
     shape: Vec<usize>,
 }
 
+impl Clone for GpuTensor {
+    fn clone(&self) -> Self {
+        Self { data: self.data.clone(), shape: self.shape.clone() }
+    }
+}
+
 impl GpuTensor {
     pub fn new(data: CudaSlice<f16>, shape: Vec<usize>) -> Self {
         let expected: usize = shape.iter().product();
@@ -41,6 +47,7 @@ impl GpuTensor {
     pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn numel(&self) -> usize { self.data.len() }
     pub fn data(&self) -> &CudaSlice<f16> { &self.data }
+    pub fn data_mut(&mut self) -> &mut CudaSlice<f16> { &mut self.data }
     /// Reshape without moving data.
     pub fn reshape(&self, shape: Vec<usize>) -> Self {
         assert_eq!(self.data.len(), shape.iter().product::<usize>());
@@ -91,6 +98,7 @@ pub(crate) struct CudaKernels {
     pub silu_mul: CudaFunction,
     pub silu_mul_split: CudaFunction,
     pub softmax_causal: CudaFunction,
+    pub softmax_causal_online: CudaFunction,
     pub rotary_emb: CudaFunction,
     pub rms_norm_rotary: CudaFunction,
     pub repeat_kv_from_cache: CudaFunction,
@@ -160,6 +168,7 @@ impl CudaState {
             silu_mul: module.load_function("silu_mul_f16")?,
             silu_mul_split: module.load_function("silu_mul_split_f16")?,
             softmax_causal: module.load_function("softmax_scaled_causal_f16")?,
+            softmax_causal_online: module.load_function("softmax_scaled_causal_online_f16")?,
             rotary_emb: module.load_function("rotary_emb_f16")?,
             rms_norm_rotary: module.load_function("rms_norm_rotary_f16")?,
             repeat_kv_from_cache: module.load_function("repeat_kv_from_cache_f16")?,
@@ -335,9 +344,18 @@ impl CudaState {
 
     /// scores = Q @ K^T  (Q: [b,h,m,d], K: [b,h,n,d] → [b,h,m,n])
     pub fn attention_qk(&self, q: &GpuTensor, k: &GpuTensor) -> Result<GpuTensor> {
+        let b = q.shape()[0]; let h = q.shape()[1]; let m = q.shape()[2]; let n = k.shape()[2];
+        let mut s = self.alloc_uninit_f16(b * h * m * n)?;
+        let mut s_t = GpuTensor::new(s, vec![b, h, m, n]);
+        self.attention_qk_into(q, k, &mut s_t)?;
+        Ok(s_t)
+    }
+
+    /// Same as `attention_qk` but writes into a pre-allocated output buffer.
+    /// Use in 28-layer prefill loops to avoid 28 × ~50ms cudaMalloc calls.
+    pub fn attention_qk_into(&self, q: &GpuTensor, k: &GpuTensor, s: &mut GpuTensor) -> Result<()> {
         let b = q.shape()[0]; let h = q.shape()[1]; let m = q.shape()[2]; let d = q.shape()[3];
         let n = k.shape()[2];
-        let mut s = self.alloc_uninit_f16(b * h * m * n)?;
         let batch = (b * h) as i32;
         unsafe {
             self.blas.gemm_strided_batched(
@@ -355,10 +373,10 @@ impl CudaState {
                     stride_b: (m * d) as i64,
                     stride_c: (m * n) as i64,
                 },
-                &k.data, &q.data, &mut s,
+                &k.data, &q.data, &mut s.data,
             )?;
         }
-        Ok(GpuTensor::new(s, vec![b, h, m, n]))
+        Ok(())
     }
 
     /// out = attn @ V  (attn: [b,h,m,n], V: [b,h,n,d] → [b,h,m,d])
@@ -367,6 +385,16 @@ impl CudaState {
         let m = attn.shape()[2]; let n = attn.shape()[3];
         let d = v.shape()[3];
         let mut o = self.alloc_uninit_f16(b * h * m * d)?;
+        let mut o_t = GpuTensor::new(o, vec![b, h, m, d]);
+        self.attention_av_into(attn, v, &mut o_t)?;
+        Ok(o_t)
+    }
+
+    /// Same as `attention_av` but writes into a pre-allocated output.
+    pub fn attention_av_into(&self, attn: &GpuTensor, v: &GpuTensor, o: &mut GpuTensor) -> Result<()> {
+        let b = attn.shape()[0]; let h = attn.shape()[1];
+        let m = attn.shape()[2]; let n = attn.shape()[3];
+        let d = v.shape()[3];
         let batch = (b * h) as i32;
         unsafe {
             self.blas.gemm_strided_batched(
@@ -384,10 +412,10 @@ impl CudaState {
                     stride_b: (m * n) as i64,
                     stride_c: (m * d) as i64,
                 },
-                &v.data, &attn.data, &mut o,
+                &v.data, &attn.data, &mut o.data,
             )?;
         }
-        Ok(GpuTensor::new(o, vec![b, h, m, d]))
+        Ok(())
     }
 }
 
@@ -487,25 +515,57 @@ impl CudaState {
     /// scores [b,h,m,n] → softmax(scale * scores) with optional causal mask. Out of place.
     pub fn softmax_scaled_causal(&self, scores: &GpuTensor, scale: f32, causal: bool) -> Result<GpuTensor> {
         let s = scores.shape();
+        // Both kernels (legacy and online) write every output position exactly
+        // once, so the buffer can be left uninitialized.
+        let out = self.alloc_uninit_f16(scores.numel())?;
+        let mut out_t = GpuTensor::new(out, s.to_vec());
+        self.softmax_scaled_causal_into(scores, scale, causal, &mut out_t)?;
+        Ok(out_t)
+    }
+
+    /// Same as `softmax_scaled_causal` but writes into a pre-allocated output.
+    /// Both the legacy and online kernels write every position of `out`
+    /// (online: valid positions get softmax values, masked positions get 0
+    /// in a dedicated tail loop), so the buffer does not need pre-zeroing.
+    pub fn softmax_scaled_causal_into(&self, scores: &GpuTensor, scale: f32, causal: bool, out: &mut GpuTensor) -> Result<()> {
+        let s = scores.shape();
         assert_eq!(s.len(), 4, "softmax expects [b,h,m,n]");
         let bh = s[0] * s[1];
         let m = s[2]; let n = s[3];
         let rows = bh * m;
+        // Block size is the same for both the legacy 3-pass kernel and the
+        // online (single-pass max+sum) kernel.  Keeping the same block size
+        // preserves the partial-sum reduction order, which in turn preserves
+        // bit-exact f16 outputs on the JA fixture's punctuation tokens —
+        // those have a degenerate zero-duration argmax that is sensitive to
+        // sub-ULP rounding differences.
         let bs = block_for_reduction(n);
-        let cfg = LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (bs, 1, 1),
-            shared_mem_bytes: bs * 4,
-        };
-        let mut out = self.alloc_uninit_f16(scores.numel())?;
         let m_i = m as i32;
         let n_i = n as i32;
         let causal_i: i32 = if causal { 1 } else { 0 };
-        let mut bb = self.stream.launch_builder(&self.k.softmax_causal);
-        bb.arg(&mut out); bb.arg(&scores.data);
-        bb.arg(&m_i); bb.arg(&n_i); bb.arg(&scale); bb.arg(&causal_i);
-        unsafe { bb.launch(cfg) }?;
-        Ok(GpuTensor::new(out, s.to_vec()))
+        if causal {
+            // Online (single-pass max+sum) kernel — needs 2*bs floats shared mem.
+            let cfg = LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (bs, 1, 1),
+                shared_mem_bytes: bs * 4 * 2,
+            };
+            let mut bb = self.stream.launch_builder(&self.k.softmax_causal_online);
+            bb.arg(&mut out.data); bb.arg(&scores.data);
+            bb.arg(&m_i); bb.arg(&n_i); bb.arg(&scale); bb.arg(&causal_i);
+            unsafe { bb.launch(cfg) }?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (bs, 1, 1),
+                shared_mem_bytes: bs * 4,
+            };
+            let mut bb = self.stream.launch_builder(&self.k.softmax_causal);
+            bb.arg(&mut out.data); bb.arg(&scores.data);
+            bb.arg(&m_i); bb.arg(&n_i); bb.arg(&scale); bb.arg(&causal_i);
+            unsafe { bb.launch(cfg) }?;
+        }
+        Ok(())
     }
 
     /// Q/K rotary embedding. x [b, h, s, d], cos/sin [total_s, d] (full table).
@@ -1185,12 +1245,25 @@ impl GpuDecoderLayer {
                cuda: &CudaState) -> Result<GpuTensor>
     {
         let b = x.shape()[0]; let s = x.shape()[1];
+        let sub_profile = std::env::var_os("QFA_SUB_PROFILE").is_some();
+        let mut t_rmsn = std::time::Duration::ZERO;
+        let mut t_qkv = std::time::Duration::ZERO;
+        let mut t_qk = std::time::Duration::ZERO;
+        let mut t_softmax = std::time::Duration::ZERO;
+        let mut t_av = std::time::Duration::ZERO;
+        let mut t_o = std::time::Duration::ZERO;
+        let mut t_mlp = std::time::Duration::ZERO;
+        let t0 = std::time::Instant::now();
 
         // 1. Input RMSNorm
         let normed = cuda.rms_norm(&x, &self.iln_w, self.eps)?;
+        if sub_profile { cuda.synchronize().ok(); t_rmsn = t0.elapsed(); }
+        let t1 = std::time::Instant::now();
 
         // 2. Fused QKV projection
         let qkv = cuda.linear_gpu(&normed, &self.qkv_w)?;
+        if sub_profile { cuda.synchronize().ok(); t_qkv = t1.elapsed(); }
+        let t2 = std::time::Instant::now();
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
 
@@ -1229,12 +1302,29 @@ impl GpuDecoderLayer {
             let nr = self.nqh / self.nkvh;
             let k_rep = cuda.repeat_kv_from_cache(&kv.k[layer_idx], b, self.nkvh, kv.max_seq, self.hd, nr, cur_len)?;
             let v_rep = cuda.repeat_kv_from_cache(&kv.v[layer_idx], b, self.nkvh, kv.max_seq, self.hd, nr, cur_len)?;
+            if sub_profile { cuda.synchronize().ok(); t_qk = t2.elapsed(); }
+            let t3 = std::time::Instant::now();
             let scores = cuda.attention_qk(&q, &k_rep)?;
+            if sub_profile { cuda.synchronize().ok(); }
+            let t_qk_only = t3.elapsed();
+            let t3b = std::time::Instant::now();
             let scale = 1.0f32 / (self.hd as f32).sqrt();
             let attn = cuda.softmax_scaled_causal(&scores, scale, use_causal && s > 1)?;
             drop(scores);
-            cuda.attention_av(&attn, &v_rep)?
+            if sub_profile { cuda.synchronize().ok(); t_softmax = t3b.elapsed(); }
+            let t4 = std::time::Instant::now();
+            let av = cuda.attention_av(&attn, &v_rep)?;
+            if sub_profile { cuda.synchronize().ok(); t_av = t4.elapsed(); }
+            // overwrite t_qk to include only the QK matmul portion (the previous
+            // t_qk above included repeat_kv too).
+            if sub_profile { t_qk = t_qk_only; }
+            av
         };
+        if sub_profile && s == 1 {
+            // decode path: fused_gqa_decode — record total attention time as t_av.
+            cuda.synchronize().ok();
+            t_av = t2.elapsed();
+        }
 
         // 8. Reshape [b, h, s, d] → [b, s, h*d], then O projection with residual add (beta=1).
         //    For decode (s == 1), swap_dims_12 is a no-op (both layouts collapse to [b, h*d]),
@@ -1246,19 +1336,30 @@ impl GpuDecoderLayer {
         };
         // h = x.clone() then h += attn_flat @ O^T   (cuBLAS beta=1)
         let mut h = x;
+        let t5 = std::time::Instant::now();
         cuda.linear_gpu_accum(&mut h, &attn_flat, &self.o_w)?;
         drop(attn_flat);
+        if sub_profile { cuda.synchronize().ok(); t_o = t5.elapsed(); }
 
         // 10. Post-attention RMSNorm
         let normed2 = cuda.rms_norm(&h, &self.pln_w, self.eps)?;
 
         // 11. Fused gate-up → SiLU·up
+        let t6 = std::time::Instant::now();
         let gu = cuda.linear_gpu(&normed2, &self.gu_w)?;
         let activated = cuda.silu_mul_split(&gu)?;
         drop(gu);
-
         // 12. Down projection with residual add (beta=1) — fused, no separate add_inplace.
         cuda.linear_gpu_accum(&mut h, &activated, &self.dp_w)?;
+        if sub_profile { cuda.synchronize().ok(); t_mlp = t6.elapsed(); }
+
+        if sub_profile {
+            eprintln!("    rmsn={:.1} qkv={:.1} qk={:.1} softmax={:.1} av={:.1} o={:.1} mlp={:.1} ms",
+                t_rmsn.as_secs_f64()*1000.0, t_qkv.as_secs_f64()*1000.0,
+                t_qk.as_secs_f64()*1000.0, t_softmax.as_secs_f64()*1000.0,
+                t_av.as_secs_f64()*1000.0, t_o.as_secs_f64()*1000.0,
+                t_mlp.as_secs_f64()*1000.0);
+        }
 
         let _ = self.hs;  // silence
         Ok(h)
@@ -1338,8 +1439,23 @@ impl GpuTextDecoder {
     {
         let sl = hs.shape()[1];
         let mut h = hs;
+        let layer_profile = std::env::var_os("QFA_LAYER_PROFILE").is_some();
+        let mut layer_times: Vec<std::time::Duration> = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
+            let t0 = std::time::Instant::now();
             h = layer.forward(h, cos, sin, kv, i, kv_start, use_causal, &self.cuda)?;
+            if layer_profile {
+                self.cuda.synchronize()?;
+                let dt = t0.elapsed();
+                layer_times.push(dt);
+            }
+        }
+        if layer_profile {
+            for (i, dt) in layer_times.iter().enumerate() {
+                eprintln!("  [layer {i:2}] {:.3} ms", dt.as_secs_f64() * 1000.0);
+            }
+            let total_ms: f64 = layer_times.iter().map(|d| d.as_secs_f64() * 1000.0).sum();
+            eprintln!("  [28 layers total] {total_ms:.1} ms");
         }
         kv.cur_len = kv_start + sl;
 

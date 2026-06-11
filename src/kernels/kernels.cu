@@ -204,6 +204,75 @@ extern "C" __global__ void softmax_scaled_causal_f16(
     }
 }
 
+// ─── Online (single-pass max+sum) softmax with causal mask ────────────
+// Fuses the max and sum reductions into one pass via running rescale.
+// Caller MUST zero the output buffer before launching (we skip writing
+// masked-tail positions so AV-matmul reads valid zeros there).
+// Shared memory layout: [bs floats max][bs floats sum] = bs*8 bytes.
+extern "C" __global__ void softmax_scaled_causal_online_f16(
+    __half* __restrict__ out,
+    const __half* __restrict__ x,
+    int m,
+    int n,
+    float scale,
+    int is_causal
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+
+    int m_idx = row % m;
+    int valid_n = (is_causal != 0) ? (m_idx + 1) : n;
+
+    extern __shared__ float sdata[];
+    float* smax = sdata;        // [bs]
+    float* ssum = sdata + bs;   // [bs]
+
+    // Single-pass online softmax statistics.
+    float my_max = -INFINITY;
+    float my_sum = 0.0f;
+    for (int j = tid; j < valid_n; j += bs) {
+        float v = __half2float(x[row * n + j]) * scale;
+        if (v > my_max) {
+            my_sum = my_sum * __expf(my_max - v) + 1.0f;
+            my_max = v;
+        } else {
+            my_sum += __expf(v - my_max);
+        }
+    }
+    smax[tid] = my_max;
+    ssum[tid] = my_sum;
+    __syncthreads();
+
+    // Tree reduction over (max, sum) pairs.
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float m1 = smax[tid],     s1 = ssum[tid];
+            float m2 = smax[tid + s], s2 = ssum[tid + s];
+            float mm = fmaxf(m1, m2);
+            float ss = (mm == -INFINITY)
+                ? 0.0f
+                : s1 * __expf(m1 - mm) + s2 * __expf(m2 - mm);
+            smax[tid] = mm;
+            ssum[tid] = ss;
+        }
+        __syncthreads();
+    }
+    float row_max = smax[0];
+    float row_sum = ssum[0];
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+
+    // Write only valid positions; masked tail is left at the pre-zeroed value.
+    for (int j = tid; j < valid_n; j += bs) {
+        float v = __half2float(x[row * n + j]) * scale - row_max;
+        out[row * n + j] = __float2half(__expf(v) * inv_sum);
+    }
+    // Zero the masked tail in a separate loop so the hot path has no branch.
+    for (int j = valid_n + tid; j < n; j += bs) {
+        out[row * n + j] = __float2half(0.0f);
+    }
+}
+
 // ─── Rotary embedding ──────────────────────────────────────────────
 // x [b, h, s, d], cos/sin [total_s, d] (broadcast over b, h, indexed at pos_offset+is).
 // rotate_half: for i<half → -x[i+half], for i>=half → x[i-half].
@@ -1192,4 +1261,5 @@ extern "C" __global__ void scatter_audio_rows_f16(
         dst_ptr[j] = src[j];
     }
 }
+
 
