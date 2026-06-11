@@ -1,19 +1,35 @@
 [package]
-name = "qwen-aligner-rs"
+name = "qwen-forced-aligner-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Qwen3 forced aligner in Rust — cudarc CUDA backend with hand-written fused kernels."
+description = "Qwen3 forced aligner in Rust — word-level alignment, hand-written CUDA / CPU engines."
 
 [[bin]]
 name = "qwen-aligner"
 path = "src/main.rs"
 
+[features]
+# Both engines compile in by default so a single binary (e.g. a desktop app)
+# can pick either at runtime via DeviceRequest.  Downstream crates can opt
+# out of either side to shrink the binary.
+default = ["cuda", "cpu"]
+
+# CUDA engine: cudarc-driven cuBLAS + NVRTC-compiled fused kernels.
+# Hot path has no DL framework on it; cudarc is just a CUDA driver binding.
+cuda = ["dep:cudarc"]
+
+# CPU engine: placeholder feature.  Once cpu_engine.rs lands it will pull in
+# `gemm` + `rayon` here.  Today the feature only exists so callers can carry
+# the DeviceRequest::Cpu code path; load_model returns "not yet implemented"
+# when actually invoked.
+cpu = []
+
 [dependencies]
-# Direct CUDA driver bindings + cuBLAS + NVRTC.  All matmul/softmax/rmsnorm/
-# rotary/attention etc. is implemented either via cuBLAS HGEMM or via the
-# hand-written kernels in src/kernels/kernels.cu (NVRTC-compiled at runtime).
-# No deep-learning framework (burn / candle / tch) is on the inference path.
-cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc", "cuda-12080"] }
+# CUDA runtime + cuBLAS + NVRTC, runtime-linked via cudart64_*.dll / libcuda.so.
+# All matmul/softmax/rmsnorm/rotary/attention etc. is implemented either via
+# cuBLAS HGEMM or via the hand-written kernels in src/kernels/kernels.cu
+# (NVRTC-compiled at runtime).  No DL framework on the inference path.
+cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc", "cuda-12080"], optional = true }
 half = "2"
 tokenizers = { version = "0.22", features = ["onig"] }
 serde = { version = "1", features = ["derive"] }

@@ -19,22 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::TextConfig;
-
-/// Minimal CPU-side weight container: f32 data + shape.  Replaces burn's
-/// `TensorData` for our one use case (load safetensors → convert dtype to f32
-/// → upload to GPU as f16).  Keeps the dep tree off burn entirely.
-pub struct WeightTensor {
-    pub data: Vec<f32>,
-    pub shape: Vec<usize>,
-}
-
-impl WeightTensor {
-    pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        let expected: usize = shape.iter().product();
-        assert_eq!(data.len(), expected, "WeightTensor data len mismatch");
-        Self { data, shape }
-    }
-}
+pub use crate::weight::WeightTensor;
 
 const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 

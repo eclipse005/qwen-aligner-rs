@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "cuda"),
+    allow(dead_code)
+)]
+//! Rationale: audio-pad expansion is part of the alignment pipeline; with the
+//! cuda feature off the alignment pipeline itself is unreachable, so these
+//! helpers come along for the ride.  Once the CPU engine lands, the CPU
+//! backend will call them and this allow-attr will go away.
+
 use anyhow::Result;
 
 pub(crate) fn feature_extract_output_len(input_len: i64) -> i64 {

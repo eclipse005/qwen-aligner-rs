@@ -1560,7 +1560,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen-aligner-rs"
+name = "qwen-forced-aligner-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",

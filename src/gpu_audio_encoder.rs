@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use crate::config::AudioConfig;
 use crate::cudarc_engine::{
-    CpuTensor, CudaState, GpuTensor, GpuWeight, WeightTensor, gpu_helpers,
+    CpuTensor, CudaState, GpuTensor, GpuWeight, gpu_helpers,
 };
+use crate::weight::WeightTensor;
 
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
 

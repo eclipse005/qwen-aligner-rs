@@ -1,7 +1,19 @@
-//! Cudarc-only inference: audio encoder + 28-layer text decoder + lm_head
-//! all run through `cudarc_engine` and `gpu_audio_encoder`.  No burn / candle
-//! tensors are allocated on the hot path.  Weight tensors load directly from
-//! safetensors into f16 device memory.
+//! Inference engine dispatch.
+//!
+//! `Qwen3ForcedAligner` is the main public type.  Internally it dispatches to
+//! one of the engine backends (CUDA today; CPU in the future) selected by
+//! `ModelOptions::device`.  The CUDA path goes through `cudarc_engine` +
+//! `gpu_audio_encoder`; no deep-learning framework is on the hot path.
+//! Weight tensors load directly from safetensors into f16 device memory.
+
+#![cfg_attr(
+    not(feature = "cuda"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
+//! Rationale: this file's CUDA-specific helpers (f16 ops, mel, MRoPE, weight
+//! loading) are only reachable when the cuda feature is on.  When the CPU
+//! engine lands, many of these helpers will be rewritten in a CPU-friendly
+//! form, at which point this allow-attr goes away.
 
 use anyhow::Context;
 use half::f16;
@@ -13,9 +25,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::AlignerConfig;
+use crate::weight::WeightTensor;
+#[cfg(feature = "cuda")]
 use crate::cudarc_engine::{
-    compute_mrope_cos_sin, CudaState, GpuKvCache, GpuTensor, GpuTextDecoder, GpuWeight, WeightTensor,
+    compute_mrope_cos_sin, CudaState, GpuKvCache, GpuTensor, GpuTextDecoder, GpuWeight,
 };
+#[cfg(feature = "cuda")]
 use crate::gpu_audio_encoder::GpuAudioEncoder;
 use crate::mel::extract_log_mel_features;
 
@@ -71,20 +86,94 @@ impl AlignRequest {
     }
 }
 
+/// Pick which engine backend powers a `Qwen3ForcedAligner`.
+///
+/// `Auto` probes the most capable backend the binary was compiled with and
+/// the host actually supports — currently CUDA first, then CPU.  Explicit
+/// variants skip the probe and fail fast if that backend isn't available
+/// (either not compiled in, or the runtime DLLs / drivers are missing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRequest {
+    /// Pure-CPU engine (gemm + rayon, no GPU dependencies).
+    ///
+    /// Not yet implemented — returns `Err("CPU engine not yet implemented")`
+    /// at load time.  See the project's `handoff.md` for the planned port
+    /// from `D:\qwen3-asr-burn\src\cpu_engine.rs`.
+    Cpu,
+    /// CUDA engine on the given device ordinal (typically `Cuda(0)`).
+    ///
+    /// Requires the `cuda` Cargo feature and the cudart / cuBLAS runtime
+    /// DLLs (`cudart64_120.dll`, `cublas64_12.dll`, `nvrtc64_120_0.dll`)
+    /// reachable through the system's DLL search path.
+    Cuda(usize),
+    /// Probe and pick the best available backend at load time.
+    ///
+    /// Order: `Cuda(0)` → `Cpu`.  Falls through silently on probe failure
+    /// (e.g. the CUDA driver isn't installed) so a single binary can run
+    /// on hosts both with and without a GPU.
+    Auto,
+}
+
+impl Default for DeviceRequest {
+    fn default() -> Self { DeviceRequest::Auto }
+}
+
+/// Load-time options for `Qwen3ForcedAligner`.
+///
+/// Kept as a struct (rather than positional args) so future knobs — engine
+/// selection, KV cache budget, etc. — can be added without breaking callers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelOptions {
+    pub device: DeviceRequest,
+}
+
+// ─── Public top-level functions (mirroring candle-version API) ─────
+
+/// Load the Qwen3 forced aligner from a model directory.
+///
+/// Equivalent to `Qwen3ForcedAligner::load(model_dir, options)`.  Kept as a
+/// free function for parity with the prior candle-backed crate, so client
+/// code can swap dependencies without source changes.
+pub fn load_model(model_dir: impl AsRef<Path>, options: ModelOptions) -> anyhow::Result<Qwen3ForcedAligner> {
+    Qwen3ForcedAligner::load(model_dir.as_ref(), options)
+}
+
+/// Explicit destructor.  `Qwen3ForcedAligner` releases all GPU memory when
+/// it drops, so this is just `drop(model)` spelled out — included for API
+/// parity with the prior candle-backed crate.
+pub fn release_model(model: Qwen3ForcedAligner) {
+    drop(model);
+}
+
 // ─── Inference engine ──────────────────────────────────────────────
 
-pub struct AlignerInference {
+/// Loaded Qwen3 forced-alignment model.  Cheap to clone via `Arc` (the
+/// heavy GPU/CPU state lives behind shared pointers internally).
+pub struct Qwen3ForcedAligner {
     config: AlignerConfig,
     tokenizer: crate::tokenizer::QwenTokenizer,
+    backend: Backend,
+}
+
+/// Engine backend variants.  Held as an enum so a single `Qwen3ForcedAligner`
+/// value can carry whichever backend `load_model` resolved at runtime.
+enum Backend {
+    #[cfg(feature = "cuda")]
+    Cuda(CudaBackend),
+    // CPU variant intentionally absent until cpu_engine.rs lands.
+}
+
+#[cfg(feature = "cuda")]
+struct CudaBackend {
     cuda: Arc<CudaState>,
     gpu_audio_encoder: Arc<GpuAudioEncoder>,
     gpu_text_decoder: Arc<GpuTextDecoder>,
 }
 
-unsafe impl Send for AlignerInference {}
+unsafe impl Send for Qwen3ForcedAligner {}
 
-impl AlignerInference {
-    pub fn load(model_dir: &Path) -> anyhow::Result<Self> {
+impl Qwen3ForcedAligner {
+    pub fn load(model_dir: &Path, options: ModelOptions) -> anyhow::Result<Self> {
         info!("Loading config...");
         let config = AlignerConfig::from_file(&model_dir.join("config.json"))
             .context("load config")?;
@@ -96,24 +185,10 @@ impl AlignerInference {
         info!("Loading tokenizer...");
         let tokenizer = crate::tokenizer::load_qwen_tokenizer(model_dir)?;
 
-        info!("Initialising cudarc engine for GPU encoders + decoder...");
-        let cuda = Arc::new(CudaState::new(0).context("cudarc init")?);
-        let gpu_ae = GpuAudioEncoder::load(
-            cuda.clone(), &weight_data, "thinker.audio_tower",
-            &config.thinker_config.audio_config,
-        ).context("load cudarc audio encoder")?;
-        let gpu_td = GpuTextDecoder::load_with(
-            cuda.clone(), &weight_data, "thinker.model",
-            &config.thinker_config.text_config,
-        ).context("load cudarc text decoder")?;
+        let backend = resolve_backend(options.device, &config, &weight_data)?;
 
         info!("Model loaded successfully.");
-        Ok(Self {
-            config, tokenizer,
-            cuda,
-            gpu_audio_encoder: Arc::new(gpu_ae),
-            gpu_text_decoder: Arc::new(gpu_td),
-        })
+        Ok(Self { config, tokenizer, backend })
     }
 
     pub fn align(&self, request: AlignRequest) -> anyhow::Result<ForcedAlignResult> {
@@ -137,10 +212,25 @@ impl AlignerInference {
     }
 
     fn align_waveform_text(&self, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<ForcedAlignResult> {
+        match &self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda(b) => self.align_waveform_text_cuda(b, waveform, text, language),
+            // Without the cuda feature (or if the future Cpu variant is matched
+            // and the CPU engine is still unimplemented), this arm fires.
+            #[allow(unreachable_patterns)]
+            _ => anyhow::bail!(
+                "no available backend: CPU engine is not yet implemented, and the \
+                 CUDA backend is either disabled at build time or unavailable at runtime"
+            ),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn align_waveform_text_cuda(&self, b: &CudaBackend, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<ForcedAlignResult> {
         let mut profile = Profile::new();
-        let cuda = &self.cuda;
-        let gpu_td = &self.gpu_text_decoder;
-        let gpu_ae = &self.gpu_audio_encoder;
+        let cuda = &b.cuda;
+        let gpu_td = &b.gpu_text_decoder;
+        let gpu_ae = &b.gpu_audio_encoder;
 
         // 1. Text tokenization (CPU)
         let (words, aligner_input) = crate::text::encode_timestamp(text, language)?;
@@ -277,6 +367,80 @@ impl AlignerInference {
 
         Ok(result)
     }
+}
+
+// ─── Backend resolution ────────────────────────────────────────────
+
+/// Probe / construct the requested engine backend.  This is where each
+/// `DeviceRequest` variant gets mapped to either a real backend or an
+/// "engine not available" error.
+fn resolve_backend(
+    device: DeviceRequest,
+    config: &AlignerConfig,
+    weight_data: &HashMap<String, WeightTensor>,
+) -> anyhow::Result<Backend> {
+    match device {
+        DeviceRequest::Auto => {
+            // Try CUDA first; on any failure (no driver, no DLL, OOM, ...)
+            // fall through to CPU.
+            #[cfg(feature = "cuda")]
+            {
+                match load_cuda_backend(0, config, weight_data) {
+                    Ok(b) => {
+                        info!("Auto: using CUDA(0) backend");
+                        return Ok(Backend::Cuda(b));
+                    }
+                    Err(err) => info!("Auto: CUDA(0) probe failed ({}); falling back to CPU", err),
+                }
+            }
+            // CPU fallback (or first choice if cuda feature disabled).
+            anyhow::bail!(
+                "Auto: no available backend (CPU engine not yet implemented; \
+                 CUDA backend either disabled at build time or unavailable at runtime)"
+            )
+        }
+        DeviceRequest::Cuda(ordinal) => {
+            #[cfg(feature = "cuda")]
+            {
+                let b = load_cuda_backend(ordinal, config, weight_data)
+                    .with_context(|| format!("load CUDA backend on device {}", ordinal))?;
+                Ok(Backend::Cuda(b))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (ordinal, config, weight_data);
+                anyhow::bail!("CUDA backend not compiled into this build (missing `cuda` feature)")
+            }
+        }
+        DeviceRequest::Cpu => {
+            // Reserved for the cpu_engine.rs port (see handoff.md).
+            let _ = (config, weight_data);
+            anyhow::bail!("CPU engine not yet implemented; use DeviceRequest::Cuda(n) for now")
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn load_cuda_backend(
+    ordinal: usize,
+    config: &AlignerConfig,
+    weight_data: &HashMap<String, WeightTensor>,
+) -> anyhow::Result<CudaBackend> {
+    info!("Initialising cudarc engine (device {}) for GPU encoders + decoder...", ordinal);
+    let cuda = Arc::new(CudaState::new(ordinal).context("cudarc init")?);
+    let gpu_ae = GpuAudioEncoder::load(
+        cuda.clone(), weight_data, "thinker.audio_tower",
+        &config.thinker_config.audio_config,
+    ).context("load cudarc audio encoder")?;
+    let gpu_td = GpuTextDecoder::load_with(
+        cuda.clone(), weight_data, "thinker.model",
+        &config.thinker_config.text_config,
+    ).context("load cudarc text decoder")?;
+    Ok(CudaBackend {
+        cuda,
+        gpu_audio_encoder: Arc::new(gpu_ae),
+        gpu_text_decoder: Arc::new(gpu_td),
+    })
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
