@@ -34,6 +34,11 @@ pub mod cudarc_engine;
 #[cfg(feature = "cuda")]
 pub mod gpu_audio_encoder;
 
+// The CPU engine module.  Text decoder is fully implemented; audio encoder
+// is currently a stub that fails fast at run time (see handoff.md).
+#[cfg(feature = "cpu")]
+pub mod cpu_engine;
+
 pub use weight::WeightTensor;
 
 pub use inference::{

@@ -96,9 +96,9 @@ impl AlignRequest {
 pub enum DeviceRequest {
     /// Pure-CPU engine (gemm + rayon, no GPU dependencies).
     ///
-    /// Not yet implemented — returns `Err("CPU engine not yet implemented")`
-    /// at load time.  See the project's `handoff.md` for the planned port
-    /// from `D:\qwen3-asr-burn\src\cpu_engine.rs`.
+    /// Text decoder is fully implemented.  The audio encoder on CPU is
+    /// **not yet implemented** — `align()` returns an error at the audio
+    /// encoder step.  See `handoff.md` for the planned port.
     Cpu,
     /// CUDA engine on the given device ordinal (typically `Cuda(0)`).
     ///
@@ -160,7 +160,8 @@ pub struct Qwen3ForcedAligner {
 enum Backend {
     #[cfg(feature = "cuda")]
     Cuda(CudaBackend),
-    // CPU variant intentionally absent until cpu_engine.rs lands.
+    #[cfg(feature = "cpu")]
+    Cpu(CpuBackend),
 }
 
 #[cfg(feature = "cuda")]
@@ -168,6 +169,17 @@ struct CudaBackend {
     cuda: Arc<CudaState>,
     gpu_audio_encoder: Arc<GpuAudioEncoder>,
     gpu_text_decoder: Arc<GpuTextDecoder>,
+}
+
+#[cfg(feature = "cpu")]
+struct CpuBackend {
+    // Held for construction-side validation; align() currently bails before
+    // touching either because the audio encoder is still a stub.  Once that
+    // lands, the text_decoder field will be read in align_waveform_text_cpu.
+    #[allow(dead_code)]
+    text_decoder: crate::cpu_engine::CpuTextDecoder,
+    #[allow(dead_code)]
+    audio_encoder: crate::cpu_engine::CpuAudioEncoder,
 }
 
 unsafe impl Send for Qwen3ForcedAligner {}
@@ -215,12 +227,13 @@ impl Qwen3ForcedAligner {
         match &self.backend {
             #[cfg(feature = "cuda")]
             Backend::Cuda(b) => self.align_waveform_text_cuda(b, waveform, text, language),
-            // Without the cuda feature (or if the future Cpu variant is matched
-            // and the CPU engine is still unimplemented), this arm fires.
+            #[cfg(feature = "cpu")]
+            Backend::Cpu(b) => self.align_waveform_text_cpu(b, waveform, text, language),
             #[allow(unreachable_patterns)]
             _ => anyhow::bail!(
-                "no available backend: CPU engine is not yet implemented, and the \
-                 CUDA backend is either disabled at build time or unavailable at runtime"
+                "no available backend: both CPU and CUDA engines are unavailable \
+                 (no CPU path compiled in, and the CUDA engine is either disabled \
+                 at build time or unavailable at runtime)"
             ),
         }
     }
@@ -367,6 +380,25 @@ impl Qwen3ForcedAligner {
 
         Ok(result)
     }
+
+    #[cfg(feature = "cpu")]
+    fn align_waveform_text_cpu(
+        &self,
+        b: &CpuBackend,
+        _waveform: &[f32],
+        _text: &str,
+        _language: &str,
+    ) -> anyhow::Result<ForcedAlignResult> {
+        // The CPU text decoder is fully implemented but the audio encoder
+        // is not (see handoff.md).  Calling `align()` with `DeviceRequest::Cpu`
+        // reaches this path and fails fast with a clear message rather than
+        // panicking on unimplemented! deep in the audio pipeline.
+        let _ = b;
+        anyhow::bail!(
+            "CPU audio encoder is not yet implemented.  Use DeviceRequest::Cuda(n) \
+             for now.  See handoff.md for the planned port (conv stem + 24 layers)."
+        )
+    }
 }
 
 // ─── Backend resolution ────────────────────────────────────────────
@@ -393,9 +425,16 @@ fn resolve_backend(
                     Err(err) => info!("Auto: CUDA(0) probe failed ({}); falling back to CPU", err),
                 }
             }
-            // CPU fallback (or first choice if cuda feature disabled).
+            #[cfg(feature = "cpu")]
+            {
+                let b = load_cpu_backend(config, weight_data)
+                    .context("Auto: CPU backend load failed")?;
+                info!("Auto: using CPU backend");
+                return Ok(Backend::Cpu(b));
+            }
+            #[cfg(not(feature = "cpu"))]
             anyhow::bail!(
-                "Auto: no available backend (CPU engine not yet implemented; \
+                "Auto: no available backend (CPU engine not compiled in; \
                  CUDA backend either disabled at build time or unavailable at runtime)"
             )
         }
@@ -413,11 +452,34 @@ fn resolve_backend(
             }
         }
         DeviceRequest::Cpu => {
-            // Reserved for the cpu_engine.rs port (see handoff.md).
-            let _ = (config, weight_data);
-            anyhow::bail!("CPU engine not yet implemented; use DeviceRequest::Cuda(n) for now")
+            #[cfg(feature = "cpu")]
+            {
+                let b = load_cpu_backend(config, weight_data)?;
+                Ok(Backend::Cpu(b))
+            }
+            #[cfg(not(feature = "cpu"))]
+            {
+                let _ = (config, weight_data);
+                anyhow::bail!("CPU engine not compiled into this build (missing `cpu` feature)")
+            }
         }
     }
+}
+
+#[cfg(feature = "cpu")]
+fn load_cpu_backend(
+    config: &AlignerConfig,
+    weight_data: &HashMap<String, WeightTensor>,
+) -> anyhow::Result<CpuBackend> {
+    info!("Loading CPU text decoder...");
+    let text_decoder = crate::cpu_engine::CpuTextDecoder::load(
+        weight_data, "thinker.model", &config.thinker_config.text_config,
+    ).context("load CPU text decoder")?;
+    info!("Loading CPU audio encoder (stub; calls bail at run time)...");
+    let audio_encoder = crate::cpu_engine::CpuAudioEncoder::load(
+        weight_data, "thinker.audio_tower", &config.thinker_config.audio_config,
+    ).context("load CPU audio encoder")?;
+    Ok(CpuBackend { text_decoder, audio_encoder })
 }
 
 #[cfg(feature = "cuda")]

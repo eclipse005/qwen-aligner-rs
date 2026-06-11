@@ -10,7 +10,7 @@
 |------|------|---------|------|
 | 原始 candle 版 | `D:\qwen-aligner` | candle 0.10 | Qwen3-ForcedAligner 词级时间戳对齐 |
 | ASR 参考项目 | `D:\qwen3-asr-burn` | **cudarc + 手写 kernel**（burn 是 fallback） | 同架构 ASR 模型，是当前项目的优化范本 |
-| **本项目** | `D:\qwen-aligner-rs` | **cudarc + 手写 CUDA C++ kernel** | aligner 重构，无 burn/candle/任何 DL 框架 |
+| **本项目** | `D:\qwen-aligner-rs` | **cudarc 手写 CUDA + gemm+rayon 手写 CPU** | aligner 重构；CUDA / CPU 双后端，零 DL 框架 |
 
 **目标**：把 RTFx 推到极致，正确性与 candle 版逐字段一致。
 
@@ -445,4 +445,85 @@ d80ef34  perf(softmax): online single-pass softmax kernel — text_decoder ~10% 
    - JA 必须 bit-exact 或 ≤ 1 token 偏移
    - 记录新的 RTFx 数字到这份文档
 
-祝你顺手 🚀
+---
+
+## 13. CPU engine 状态（commit `4e337b2` 之后）
+
+CUDA / CPU 双后端架构已落地。`DeviceRequest::{Cuda(n), Cpu, Auto}` 三种入口全打通。
+
+### 13.1 已实现
+
+| 组件 | CUDA 路径 | CPU 路径 | 文件 |
+|---|---|---|---|
+| 28 层 text decoder forward | ✅ 完整 | ✅ **完整** | `cudarc_engine.rs` / `cpu_engine.rs` |
+| QKV fused linear + silu_mul_split | ✅ cudarc | ✅ gemm | `cudarc_engine.rs` / `cpu_engine.rs` |
+| online causal softmax | ✅ 自写 kernel | ✅ rayoned 3-pass | `kernels.cu` / `cpu_engine.rs` |
+| prefill attention（scores materialised） | ✅ cuBLAS batched GEMM | ✅ 手写 nested-parallel | `cudarc_engine.rs` / `cpu_engine.rs` |
+| MRoPE cos/sin precompute | ✅ | ✅ | `cudarc_engine.rs` / `cpu_engine.rs` |
+| lm_head（独立权重，不是 tied embed） | ✅ | ✅ linear | `cudarc_engine.rs` / `cpu_engine.rs` |
+| 24 层 audio encoder + conv stem | ✅ 完整 | ❌ **stub，bail** | `gpu_audio_encoder.rs` |
+
+CPU 路径里 m=1 lm_head GEMV 用 gemm crate（强制 `Parallelism::Rayon(0)`，避免 burn-flex 的 7M 阈值把 decode 留下单线程）。f32-only（现代 x86 缺 f16 SIMD，f32 实际比 f16-with-upcast 快）。
+
+### 13.2 验证
+
+| 测试 | 结果 |
+|---|---|
+| `cargo build --release`（default: cuda + cpu） | 0 warning、0 error |
+| `cargo build --release --no-default-features --features cpu` | 0 warning、0 error |
+| 15s 冒烟 `--device cuda` | bit-exact（与 candle baseline 一致） |
+| `--device cpu` | text decoder 加载成功，audio encoder 步骤清晰 bail "not yet implemented" |
+| `--device auto`（CUDA build） | 走 CUDA |
+| `--device auto`（CPU-only build） | 走 CPU |
+| `--device cuda`（CPU-only build） | 清晰 bail "CUDA backend not compiled" |
+
+### 13.3 接入 voxtrans 的最小改动
+
+voxtrans `asr_align.rs`：
+
+```diff
+- use qwen_forced_aligner_rs::{ AlignRequest, AudioInput, DTypeRequest, DeviceRequest, ForcedAlignItem, ForcedAlignResult,
+-     ModelOptions, TextInput, load_model };
++ use qwen_forced_aligner_rs::{ AlignRequest, AudioInput, DeviceRequest, ForcedAlignItem, ForcedAlignResult,
++     ModelOptions, TextInput, load_model };
+  ...
+  ModelOptions { device: device.qwen_device,
+-                dtype: DTypeRequest::F16 }
++               /* 删掉 dtype，cudarc 强制 f16，CPU 自己决定 */ }
+```
+
+`Cargo.toml` 改 git URL 指到 `qwen-forced-aligner-rs` repo。约 3 行 diff。
+
+### 13.4 下一步（按优先级）
+
+1. **Audio encoder CPU 实现**（剩余 CPU 引擎最后一块拼图）
+   - conv stem 3 × stride-2 conv2d（im2col + gemm 已经在 `cpu_engine.rs` 里有 stub，但没接完整 per-chunk reshape）
+   - 24 层 transformer (LayerNorm + GELU FFN + full attn)
+   - 估算 600-800 行（参考 `gpu_audio_encoder.rs` 391 行）
+
+2. **CUDA-side Flash-Attention 融合**（最大单点收益 -35%）
+   - 见 §5.2
+   - text_decoder 28 层 减 1.5s，EN RTFx 39→60+
+
+3. **Flash-Attention 移植到 CPU**（同步把 §5.2 的算法搬到 CPU；f32 m=Q@K^T 比 CUDA 慢 ~50x，所以收益会小一些）
+
+4. **libloading 改造**（实现"单一安装包"）
+   - cudarc 加 `libloading::Library::new("cudart64_120.dll")` 代替编译期链接
+   - 运行时探测：cudart64 找不到就退化 CPU 路径
+
+5. **继续 RTFx 优化**（handoff §5）
+
+---
+
+## 14. Git 历史关键 commits
+
+```
+4e337b2  feat(cpu): CPU text decoder engine — DeviceRequest::Cpu/Auto wire-up
+40b4cf2  feat(api): candle-compatible public API + cuda/cpu feature gating
+ce94662  docs: rewrite handoff.md as cudarc-engine baton-pass document
+9e337b2  refactor: drop burn entirely — cudarc + hand-written kernels only
+73416fa  chore: gitignore tests/ — local-only fixtures
+4dedab0  chore: gitignore bench_outputs/ — local-only benchmark output
+d80ef34  perf(softmax): online single-pass softmax kernel — text_decoder ~10% faster
+8e130a9  feat(perf): rewrite with cudarc — 1.87x over candle, RTFx 33-57
+```

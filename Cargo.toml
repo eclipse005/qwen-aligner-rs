@@ -18,11 +18,12 @@ default = ["cuda", "cpu"]
 # Hot path has no DL framework on it; cudarc is just a CUDA driver binding.
 cuda = ["dep:cudarc"]
 
-# CPU engine: placeholder feature.  Once cpu_engine.rs lands it will pull in
-# `gemm` + `rayon` here.  Today the feature only exists so callers can carry
-# the DeviceRequest::Cpu code path; load_model returns "not yet implemented"
-# when actually invoked.
-cpu = []
+# CPU engine: gemm handles every matmul (with forced rayon parallelism for
+# the m=1 lm_head GEMV that burn-flex would otherwise leave single-threaded),
+# and rayon parallelises every hand-written elementwise / reduction op.
+# Tensors are f32 (Vec<f32>) — modern x86 has no native f16 SIMD outside
+# Sapphire Rapids, so f32 ends up faster than f16 with upcast.
+cpu = ["dep:gemm", "dep:rayon"]
 
 [dependencies]
 # CUDA runtime + cuBLAS + NVRTC, runtime-linked via cudart64_*.dll / libcuda.so.
@@ -30,6 +31,8 @@ cpu = []
 # cuBLAS HGEMM or via the hand-written kernels in src/kernels/kernels.cu
 # (NVRTC-compiled at runtime).  No DL framework on the inference path.
 cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc", "cuda-12080"], optional = true }
+gemm = { version = "0.18", optional = true }
+rayon = { version = "1", optional = true }
 half = "2"
 tokenizers = { version = "0.22", features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
