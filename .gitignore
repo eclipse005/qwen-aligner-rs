@@ -1,0 +1,8 @@
+/target
+
+# Model weights (1.2GB, downloaded at runtime)
+/models/
+
+# Run-output JSONs (regenerated on every align run)
+/test_output.json
+/candle_output.json
