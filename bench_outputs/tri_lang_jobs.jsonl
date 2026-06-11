@@ -1,3 +1,0 @@
-{"audio":"D:\\Qwen3-ASR\\tests\\test.wav","text":"D:\\Qwen3-ASR\\tests\\test.txt","output":"en.json","language":"English"}
-{"audio":"D:\\Qwen3-ASR\\tests\\zh_3m.wav","text":"D:\\Qwen3-ASR\\tests\\zh_3m.txt","output":"zh.json","language":"Chinese"}
-{"audio":"D:\\Qwen3-ASR\\tests\\ja.wav","text":"D:\\Qwen3-ASR\\tests\\ja.txt","output":"ja.json","language":"Japanese"}
