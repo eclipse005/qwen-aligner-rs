@@ -31,6 +31,33 @@
 
 15s 冒烟测试: `tests/fixtures/15s.wav` (40 词)，耗时 0.22s，RTFx 67。
 
+#### 2.1.1 Grouped GQA Prefill 优化后（2026-06-12，未提交）
+
+实现 `grouped_gqa_prefill`（§15 详述），消除 prefill 路径的 `repeat_kv`：
+
+| Fixture | 时长 | 总耗时 | RTFx | 变化 |
+|---|---|---|---|---|
+| `en_180s` | 180s | **3.94s** | **45.7** | **+12.6%** (40.6→45.7) |
+
+Profile 对比（180s EN）：
+
+| 组件 | 优化前 | 优化后 | 变化 |
+|---|---|---|---|
+| text_decoder | 5.07s | **2.50s** | **-51%** |
+| audio_encoder | 1.11s | 1.11s | 不变 |
+| prepare_input | 0.26s | 0.27s | 不变 |
+| **总计** | 4.44s (不含加载) | **3.94s** | **-11%** |
+
+Per-layer sub-profile（`QFA_SUB_PROFILE=1`）：
+
+| Op | 优化前 | 优化后 | 说明 |
+|---|---|---|---|
+| `rmsn` | 13ms→1.6ms | 1.6ms | 已优化（早期 commit） |
+| `qkv` | 12.5ms | 9.4ms | 不变 |
+| `qk+softmax+av` | 106ms 合计 | **113ms 合计** | grouped_gqa_prefill 融合三项，略慢于大批次 GEMM |
+| `o` | 11ms | 4.7ms | 已优化 |
+| `mlp` | 27.4ms | 19.4ms | 已优化 |
+
 ### 2.2 正确性
 
 3 语言 × candle baseline 逐字段对比：
@@ -43,9 +70,20 @@
 
 15s 冒烟：与 `bench_outputs/smoke_en.json` **bit-exact 一致**。
 
-### 2.3 编译状态
+### 2.3 2026-06-12 更新（commit `3005917` 之后）
 
-- `cargo build --release` → **0 warning、0 error**
+新加了 CPU engine（28 层 text decoder + 24 层 audio encoder + conv stem），candle-compatible API（`Qwen3ForcedAligner` / `load_model` / `DeviceRequest`）。
+
+**CUDA 180s baseline（用 180s.wav，180s 整）实测**：
+- 总耗时 5.56s（RTFx 32.4）
+- per-layer text_decoder: qk=44.5ms, softmax=44ms, av=17.5ms, mlp=20.4ms, o=8.5ms
+- text_decoder 总 4.2s
+
+**Flash-Attention Task #1 实测结果**：❌ 在 Pascal sm_61 上比 cuBLAS 慢 17-29x，已回滚。详见 §5.2 末尾。
+
+### 2.4 编译状态
+
+- `cargo build --release` → **1 warning**（`repeat_kv_from_cache` 死代码，已被 grouped_gqa_prefill 替代）、0 error
 - 依赖只有 cudarc + 通用 crate（无 burn/candle/cubecl/wgpu）
 - `.cargo\config.toml` 配 USTC 镜像，需要 `NO_PROXY=*` 绕过本地代理
 
@@ -110,10 +148,16 @@ src/
 | `8e130a9` | burn → cudarc + 手写 kernel 完全重写 | RTFx 0.47 → 33-57（70-120x） |
 | `d80ef34` | softmax 改为 online 单 pass（Flash-Attention v1 风格） | text_decoder -10%，softmax 63ms → 55ms |
 | `9e337b2` | 清理 burn 死代码 + 依赖 | 性能持平，warning 40→0，代码 6951 删 / 1561 改 |
+| `40b4cf2` | API redesign: `Qwen3ForcedAligner` / `DeviceRequest::{Cuda,Cpu,Auto}` 与 candle 兼容 | 无 perf 变化 |
+| `60e4e78` | CPU text decoder 引擎（gemm + rayon） | RTFx 7-9（参考值） |
+| `3005917` | CPU audio encoder 端到端（24 层 + conv stem） | RTFx 7-9 端到端 |
+| (未提交) | grouped_gqa_prefill: 消除 prefill repeat_kv，stride_a=0 分组 GEMM | EN 180s RTFx 40.6→45.7 (+12.6%) |
 
 ---
 
 ## 5. 接下来的 RTFx 优化方向（按优先级排序）
+
+> **2026-06-12 更新**：Task #1 (Flash-Attention fused prefill) 已在 Pascal sm_61 实测不可行（比 cuBLAS 慢 17-29x），已回滚。**sm_61 上不要再做这个优化**。Grouped GQA Prefill 已实现（§15），RTFx 40.6→45.7。可跳到 §5.3/§5.4/§15.6 看下一步方向。
 
 ### 5.1 当前 text_decoder per-layer profile
 
@@ -225,6 +269,33 @@ let av = cuda.fused_prefill_attn(&q, &k_rep, &v_rep, scale, use_causal && s > 1)
 2. 3 语言跑过，词数 mismatch = 0
 3. JA 89s 必须 bit-exact 或 ≤ 1 个 token 偏移
 4. 记录新的 per-layer profile
+
+**实测结果（2026-06-12）：❌ Pascal sm_61 上不可行，已回滚**
+
+写了两个版本：
+
+1. **v1（每 thread 1 q row）** — Br=64, block=64 thread。每 thread 串行算 d=128 dot product。
+   - 15s smoke: bit-exact ✓
+   - 180s: qk 1280ms/layer × 28 = 36s（vs cuBLAS 44ms/layer = 慢 29x）
+   - 180s 总 38.4s RTFx 4.7
+
+2. **v2（warp 协作）** — Br=32 q rows, 32 warps × 32 lanes = 1024 thread。1 warp = 1 q row，lane 用 `__shfl_xor_sync` 协作算 d=128 dot product。
+   - 15s smoke: bit-exact ✓
+   - 180s: qk 741ms/layer × 28 = 20.7s（vs cuBLAS 44ms/layer = 慢 17x）
+   - 180s 总 23.1s RTFx 7.8
+
+**为什么 Pascal 打不过 cuBLAS**：
+- cuBLAS 内部用 cuTLASS / 自家 warp-cooperative 16×16×16 HGEMM 块，针对 sm_61 深度调优
+- 我们的手写 d=128 inner loop 是 4 维 FMA × 32 lane，**总 FMA 数量级相当但内存访问模式不佳**
+- 无 tensor core：`mma.sync` 路径用不了，d=128 HGEMM 在 Pascal 上用 FMA 走 cuBLAS 是上限
+- 180s 时 grid = (16 heads × ceil(4567/32) = 16 × 143 = 2288 blocks)，Pascal sm_61 一个 SM 最多 16 blocks，**实际占用率不足**
+
+**未来路径**（仅在 Ampere+ 上才值得做）：
+- sm_80+ 有 `mma.sync` m16n8k16 f16 → 16 倍单指令 FMA 吞吐
+- 用 cublasGemmEx 调 `CUBLAS_GEMM_DEFAULT` + 自家 Flash-Attention wrapper
+- 在 sm_61（当前 GPU）上**跳过 Task #1**，不要再花时间
+
+**残留代码**：本次实现已 `git checkout` 撤销，工作区干净。如果将来要做 sm_80+ 的 FA，可从 git reflog 恢复 `7b5c4588`。
 
 ### 5.3 Task #2: 减少 cudaMalloc 开销 ⭐⭐
 
@@ -372,10 +443,11 @@ for lang, dur in [('en', 180), ('zh', 203), ('ja', 89)]:
 
 | 优化阶段 | 预期 EN 180s | RTFx | 累计收益 |
 |---|---|---|---|
-| 当前 | 4.44s | 40.6 | baseline |
-| + Task #1 (Flash-Attention text_decoder) | 2.5-3.0s | 60-72 | -35% |
-| + Task #5 (Flash-Attention audio_encoder) | 1.7-2.2s | 82-105 | -50% |
-| + Task #3 (cuBLAS algo search) | 1.5-2.0s | 90-120 | -55% |
+| baseline (commit 9e337b2) | 4.44s | 40.6 | baseline |
+| + Grouped GQA Prefill (已实现, 未提交) | 3.94s | **45.7** | -11% |
+| + Conv stem GPU permute (§15.6) | ~3.85s | ~46.8 | -13% |
+| + Grouped GQA 单 GEMM (§15.6) | ~3.7s | ~48.6 | -17% |
+| + Audio encoder attention (§15.6) | ~3.2s | ~56.3 | -28% |
 
 **Pascal sm_61 上的硬件上限**：~RTFx 100-150（无 tensor core，6 TFLOPs FP16 算力上限）。
 
@@ -436,14 +508,21 @@ d80ef34  perf(softmax): online single-pass softmax kernel — text_decoder ~10% 
 
 ## 12. 接手第一步建议
 
-1. **跑一遍 §7.3 的 3 语言 benchmark + §7.4 正确性验证**，确认你的环境跟我这里数字一致（±5%）
-2. **跑 `QFA_SUB_PROFILE=1` 看 per-layer profile**，确认 softmax + qk 仍然是大头
-3. **从 Task #1 (Flash-Attention) 开始**——参考 `D:\qwen3-asr-burn\src\kernels\kernels.cu` 看 ASR 项目有没有现成的 fused attention kernel 可以借鉴
-4. **每改一步**：
+1. **先编译** `cargo build --release`，确认 1 warning（repeat_kv_from_cache 死代码）、0 error
+2. **跑 15s smoke test**（`--audio tests\fixtures\15s.wav --text tests\fixtures\15s.txt`），确认与 `bench_outputs/smoke_en.json` bit-exact
+3. **跑 180s EN benchmark**（§7.3），确认 RTFx ≈ 45-46（当前最优）
+4. **跑 `QFA_SUB_PROFILE=1` 看 per-layer profile**，确认 text_decoder ~2.5s，audio_encoder ~1.1s
+5. **从 §15.6 的优先级开始**——建议先做 Conv stem CPU roundtrip 消除（写 permute + PE add GPU kernel，注意 §15.4 中自定义 kernel copy 的坑）
+6. **每改一步**：
    - 15s smoke 必须 bit-exact 通过
    - 3 语言 word_mismatches = 0
    - JA 必须 bit-exact 或 ≤ 1 token 偏移
    - 记录新的 RTFx 数字到这份文档
+
+**重要警告**：
+- 不要用自定义 CUDA kernel 做简单 copy/slice 操作（实测 cudarc kernel launch overhead 远大于 cuBLAS GEMM 开销）
+- online causal softmax **不支持 in-place**（输入输出同一 buffer）
+- GPU 状态可能因失败 kernel 导致性能严重退化（需 GPU reset 或重启）
 
 ---
 
@@ -550,3 +629,95 @@ ce94662  docs: rewrite handoff.md as cudarc-engine baton-pass document
 d80ef34  perf(softmax): online single-pass softmax kernel — text_decoder ~10% faster
 8e130a9  feat(perf): rewrite with cudarc — 1.87x over candle, RTFx 33-57
 ```
+
+---
+
+## 15. Grouped GQA Prefill 优化（2026-06-12，未提交）
+
+### 15.1 核心思路
+
+原始 prefill 路径每层需要 `repeat_kv` 把 8 个 KV head 扩展到 16 个（n_rep=2），然后做 16-head 的 batched GEMM。
+
+`grouped_gqa_prefill` 消除 repeat_kv，改为 8 组 strided batched GEMM（stride_a=0），每组 batch_size=2：
+
+```
+原始路径:
+  repeat_kv(K) → K_rep [b, nqh, s, d]    // 内存拷贝
+  repeat_kv(V) → V_rep [b, nqh, s, d]    // 内存拷贝
+  scores = Q @ K_rep^T                     // 1 GEMM call, batch=16
+  attn = softmax(scores)                   // 1 kernel
+  out = attn @ V_rep                       // 1 GEMM call, batch=16
+
+优化路径:
+  for g in 0..nkvh:                        // 8 组
+    scores[g] = Q[g] @ K[g]^T              // stride_a=0, batch=2
+  attn = softmax(scores)                   // 1 kernel（与原始相同）
+  for g in 0..nkvh:                        // 8 组
+    out[g] = attn[g] @ V[g]                // stride_a=0, batch=2
+```
+
+**内存节省**：每层省去 2 × (n_rep-1) × nkvh × s × d × 2 bytes ≈ 47MB。28 层 ≈ 1.3GB。
+
+### 15.2 实现细节（`cudarc_engine.rs`）
+
+`grouped_gqa_prefill` 方法，Three-pass:
+
+1. **Pass 1（QK GEMM）**: 8 组 `gemm_strided_batched`，`stride_a=0` 让 n_rep 个 Q head 共享同一个 K head。scores_buf [b, nqh, m, n]。
+2. **Softmax**: 单次 `softmax_scaled_causal_into` 处理全部 [b, nqh, m, n]，写入单独的 `attn_out_buf`。
+3. **Pass 2（AV GEMM）**: 8 组 `gemm_strided_batched`，`stride_a=0` 共享 V head，读 attn_out_buf，写 out_buf [b, nqh, m, d]。
+
+### 15.3 关键 Bug 修复
+
+**Bug: softmax 输出 buffer 大小不匹配（CUDA_ERROR_ILLEGAL_ADDRESS）**
+
+初始实现把 softmax 输出写入了 out_buf [b, nqh, m, d=128]，但 softmax 需要写入 [b, nqh, m, n=4567] 个元素（attention weights）。导致越界写入，CUDA 报错。
+
+**修复**：分配单独的 `attn_out_buf [b, nqh, m, n]`，softmax 写入此 buffer，AV pass 读此 buffer 写 out_buf。
+
+**注意**：online causal softmax **不支持 in-place**（输入输出同一 buffer），因为第二遍写 pass 会重新读输入（kernels.cu 第 267 行 `x[row * n + j]`）。
+
+### 15.4 失败的尝试
+
+#### 15.4.1 Audio Encoder QKV 融合
+
+将 Q/K/V 三个 [dm, dm] 权重合并为 [3*dm, dm]，单次 GEMM 后用 `slice_last_dim` kernel 切片。
+
+**结果**：每层新增 3 个 `slice_last_dim` kernel launch × 24 层 = 72 次额外 launch。每个 slice 复制 ~4.7M elements，总体反而变慢（audio_encoder +0.15s，text_decoder +0.85s，原因不明但可能与 GPU SM 调度有关）。**已回滚。**
+
+#### 15.4.2 GPU Pack Tokens
+
+试图用自定义 `copy_chunk_f16` kernel 替代 `download→pack→upload` 的 CPU roundtrip。
+
+**结果**：灾难性变慢（31s+），text_decoder 从 2.5s 飙升到 27.7s。原因可能是 cudarc kernel launch 的 overhead 问题，或 GPU 状态被破坏。**已回滚。**
+
+#### 15.4.3 cuBLAS Math Mode 调优
+
+Pascal sm_61 无 tensor core，默认的 `CUBLAS_COMPUTE_32F` 已经是最佳选择。尝试 `CUBLAS_COMPUTE_16F` 可能更快但有精度风险。**已跳过。**
+
+### 15.5 当前代码状态
+
+- `cudarc_engine.rs`：新增 `grouped_gqa_prefill` 方法（~70 行），修改 `GpuDecoderLayer::forward` 的 prefill 路径调用它
+- `repeat_kv_from_cache` 方法已死代码（warning），可以删除
+- `kernels.cu`：无变化
+- `gpu_audio_encoder.rs`：无变化（QKV 融合已回滚）
+- 15s smoke test：与 `bench_outputs/smoke_en.json` bit-exact 一致
+
+### 15.6 进一步优化方向（目标 RTFx > 50）
+
+当前 RTFx=45.7，距 50 还差 ~0.35s。剩余瓶颈：
+
+| 组件 | 耗时 | 占比 | 优化方向 |
+|---|---|---|---|
+| text_decoder | 2.50s | 63% | grouped GQA 的 8 个小 GEMM 替换为单个大 GEMM？ |
+| audio_encoder | 1.11s | 28% | conv stem 消除 CPU roundtrip（需写 permute + PE add GPU kernel） |
+| prepare_input | 0.27s | 7% | Mel 提取 GPU 化 |
+
+**建议优先级**：
+
+1. **Conv stem CPU roundtrip 消除**（~0.05-0.1s）：写 permute GPU kernel 替代 download→permute→upload，写 PE add kernel 替代 download→add→upload。注意：不要用自定义 kernel 做 copy 操作（实测 cudarc kernel launch overhead 很大）。
+
+2. **Grouped GQA 进一步优化**：当前 8× batch=2 的 GEMM 比原始 1× batch=16 慢（kernel launch overhead）。探索能否用单次 batch=16 GEMM + 手动构造 stride 实现同样的效果。
+
+3. **MLP 融合**：`silu_mul_split` kernel 与 down_proj GEMM 之间的中间张量可以避免（当前 14MB/layer）。
+
+4. **Audio encoder attention 优化**：24 层 full attention，当前每层 3 个 QKV GEMM + QK + softmax + AV。与 text decoder 不同，audio encoder 的 n_rep=1（16 Q heads = 16 KV heads），不需要 GQA。

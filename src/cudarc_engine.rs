@@ -11,7 +11,8 @@ use anyhow::Result;
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::cublas::sys;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream,
+    LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use half::f16;
@@ -354,6 +355,99 @@ impl CudaState {
         let mut o_t = GpuTensor::new(o, vec![b, h, m, d]);
         self.attention_av_into(attn, v, &mut o_t)?;
         Ok(o_t)
+    }
+
+    /// Grouped GQA prefill: replaces repeat_kv + attention_qk + softmax + attention_av.
+    ///
+    /// Instead of materialising the full repeated K/V tensors (nqh = nkvh × n_rep),
+    /// loops over nkvh groups of n_rep Q heads each, doing a smaller strided-batched
+    /// GEMM per group.  Eliminates:
+    ///   • 2 × repeat_kv kernel launches per layer
+    ///   • 2 × (n_rep − 1) × nkvh × s × d elements of dead memory copies
+    ///
+    /// For this model (nqh=16, nkvh=8, n_rep=2, s≈4567, d=128):
+    ///   saves ~47 MB of useless HBM copies per layer × 28 layers ≈ 1.3 GB total.
+    pub fn grouped_gqa_prefill(
+        &self,
+        q: &GpuTensor, k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        nkvh: usize, max_seq: usize,
+        scale: f32, causal: bool,
+    ) -> Result<GpuTensor> {
+        let b = q.shape()[0];
+        let nqh = q.shape()[1];
+        let m   = q.shape()[2];
+        let d   = q.shape()[3];
+        let n   = m; // kv length == q length for prefill
+        let n_rep = nqh / nkvh;
+        let batch_per_group = n_rep as i32;
+        let score_sz = batch_per_group as usize * m * n;
+
+        let mut scores_buf   = self.alloc_uninit_f16(b * nqh * m * n)?;
+        let attn_out_buf     = self.alloc_uninit_f16(b * nqh * m * n)?; // softmax output
+        let mut out_buf      = self.alloc_uninit_f16(b * nqh * m * d)?; // final AV output
+
+        // Pass 1: compute all QK scores (nkvh batched GEMM calls, stride_a=0 for K reuse)
+        for g in 0..nkvh {
+            let q_off  = g * n_rep * m * d;
+            let kv_off = g * max_seq * d;
+            let s_off  = g * n_rep * m * n;
+            unsafe {
+                self.blas.gemm_strided_batched(
+                    StridedBatchedConfig {
+                        gemm: GemmConfig {
+                            transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                            transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                            m: n as i32, n: m as i32, k: d as i32,
+                            alpha: f16::from_f32(1.0),
+                            lda: d as i32, ldb: d as i32,
+                            beta: f16::from_f32(0.0), ldc: n as i32,
+                        },
+                        batch_size: batch_per_group,
+                        stride_a: 0, // single K head shared by n_rep Q heads
+                        stride_b: (m * d) as i64,
+                        stride_c: (m * n) as i64,
+                    },
+                    &k_cache.slice(kv_off..kv_off + max_seq * d),
+                    &q.data().slice(q_off..q_off + n_rep * m * d),
+                    &mut scores_buf.slice_mut(s_off..s_off + score_sz),
+                )?;
+            }
+        }
+
+        // Softmax over all [b, nqh, m, n] — writes attention weights to attn_out_buf
+        let scores_t = GpuTensor::new(scores_buf, vec![b, nqh, m, n]);
+        let mut attn_out_t = GpuTensor::new(attn_out_buf, vec![b, nqh, m, n]);
+        self.softmax_scaled_causal_into(&scores_t, scale, causal, &mut attn_out_t)?;
+
+        // Pass 2: AV products — stride_a=0 shares V head across n_rep Q heads
+        for g in 0..nkvh {
+            let kv_off = g * max_seq * d;
+            let a_off  = g * n_rep * m * n;
+            let o_off  = g * n_rep * m * d;
+            unsafe {
+                self.blas.gemm_strided_batched(
+                    StridedBatchedConfig {
+                        gemm: GemmConfig {
+                            transa: sys::cublasOperation_t::CUBLAS_OP_N,
+                            transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                            m: d as i32, n: m as i32, k: n as i32,
+                            alpha: f16::from_f32(1.0),
+                            lda: d as i32, ldb: n as i32,
+                            beta: f16::from_f32(0.0), ldc: d as i32,
+                        },
+                        batch_size: batch_per_group,
+                        stride_a: 0, // single V head shared
+                        stride_b: (m * n) as i64,
+                        stride_c: (m * d) as i64,
+                    },
+                    &v_cache.slice(kv_off..kv_off + max_seq * d),
+                    &attn_out_t.data().slice(a_off..a_off + score_sz),
+                    &mut out_buf.slice_mut(o_off..o_off + n_rep * m * d),
+                )?;
+            }
+        }
+
+        Ok(GpuTensor::new(out_buf, vec![b, nqh, m, d]))
     }
 
     /// Same as `attention_av` but writes into a pre-allocated output.
@@ -1155,7 +1249,7 @@ impl GpuDecoderLayer {
         let mut t_rmsn = std::time::Duration::ZERO;
         let mut t_qkv = std::time::Duration::ZERO;
         let mut t_qk = std::time::Duration::ZERO;
-        let mut t_softmax = std::time::Duration::ZERO;
+        let t_softmax = std::time::Duration::ZERO;
         let mut t_av = std::time::Duration::ZERO;
         let mut t_o = std::time::Duration::ZERO;
         let mut t_mlp = std::time::Duration::ZERO;
@@ -1185,11 +1279,10 @@ impl GpuDecoderLayer {
         let cur_len = kv_start + s;
 
         // 6+7. Attention.  Three paths:
-        //   - Prefill (s > 1): repeat_kv + cuBLAS strided batched GEMMs.
+        //   - Prefill (s > 1): grouped GQA — loops over nkvh KV-head groups,
+        //     stride_a=0 batched GEMM for QK and AV (no repeat_kv needed).
         //   - Decode short (s == 1, cur_len ≤ 1024): single-block fused_gqa_decode.
-        //   - Decode long  (s == 1, cur_len > 1024): split-K fused_gqa_decode (multiple blocks
-        //     per (b, q_head), online-softmax merge).  Cuts per-token attention latency by ~2x
-        //     on long contexts where a single block bottlenecks on chunk-serial K reads.
+        //   - Decode long  (s == 1, cur_len > 1024): split-K fused_gqa_decode.
         let attn_out = if s == 1 {
             let scale = 1.0f32 / (self.hd as f32).sqrt();
             const SPLIT_THRESHOLD: usize = 1024;
@@ -1205,25 +1298,16 @@ impl GpuDecoderLayer {
                     self.nkvh, kv.max_seq, cur_len, scale)?
             }
         } else {
-            let nr = self.nqh / self.nkvh;
-            let k_rep = cuda.repeat_kv_from_cache(&kv.k[layer_idx], b, self.nkvh, kv.max_seq, self.hd, nr, cur_len)?;
-            let v_rep = cuda.repeat_kv_from_cache(&kv.v[layer_idx], b, self.nkvh, kv.max_seq, self.hd, nr, cur_len)?;
-            if sub_profile { cuda.synchronize().ok(); t_qk = t2.elapsed(); }
-            let t3 = std::time::Instant::now();
-            let scores = cuda.attention_qk(&q, &k_rep)?;
-            if sub_profile { cuda.synchronize().ok(); }
-            let t_qk_only = t3.elapsed();
-            let t3b = std::time::Instant::now();
             let scale = 1.0f32 / (self.hd as f32).sqrt();
-            let attn = cuda.softmax_scaled_causal(&scores, scale, use_causal && s > 1)?;
-            drop(scores);
-            if sub_profile { cuda.synchronize().ok(); t_softmax = t3b.elapsed(); }
-            let t4 = std::time::Instant::now();
-            let av = cuda.attention_av(&attn, &v_rep)?;
-            if sub_profile { cuda.synchronize().ok(); t_av = t4.elapsed(); }
-            // overwrite t_qk to include only the QK matmul portion (the previous
-            // t_qk above included repeat_kv too).
-            if sub_profile { t_qk = t_qk_only; }
+            let av = cuda.grouped_gqa_prefill(
+                &q, &kv.k[layer_idx], &kv.v[layer_idx],
+                self.nkvh, kv.max_seq, scale, use_causal && s > 1,
+            )?;
+            if sub_profile {
+                cuda.synchronize().ok();
+                // grouped_gqa_prefill fuses QK + softmax + AV; report as qk.
+                t_qk = t2.elapsed();
+            }
             av
         };
         if sub_profile && s == 1 {

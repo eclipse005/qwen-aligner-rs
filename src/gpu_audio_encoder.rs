@@ -328,8 +328,6 @@ impl GpuAudioEncoder {
         let n_total: usize = chunk_tokens.iter().sum();
 
         // 2. Pack valid tokens of each chunk into a single contiguous [1, n_total, d_model] buffer
-        //    (this is the slice loop, on GPU via download+pack since t2 differs per chunk).
-        //    Tail chunk has chunk_tokens[i] < t2; full chunks have == t2.
         let co_cpu = cuda.download_tensor(&co_gpu)?;
         let mut packed = Vec::with_capacity(n_total * dm);
         for (idx, &v) in chunk_tokens.iter().enumerate() {
