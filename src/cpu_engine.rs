@@ -77,12 +77,13 @@ pub(crate) fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
     assert_eq!(k, w.cols, "linear K mismatch: x last={} vs W cols={}", k, w.cols);
     let mut out_shape = x.shape.clone();
     out_shape[nd - 1] = n;
-    if m == 1 {
-        let out = linear_gemv(&x.data, w);
-        return CpuTensor::new(out, out_shape);
-    }
-    let mut out = vec![0.0f32; m * n];
-    gemm_row_major(&mut out, &x.data, w, m, 0.0);
+    let mut out = if m == 1 {
+        linear_gemv(&x.data, w)
+    } else {
+        let mut o = vec![0.0f32; m * n];
+        gemm_row_major(&mut o, &x.data, w, m, 0.0);
+        o
+    };
     CpuTensor::new(out, out_shape)
 }
 
@@ -618,7 +619,7 @@ impl CpuConv2d {
                 self.weight.data.as_ptr(),
                 1, cols_per_row as isize,      // lhs [c_out, c_in*9]: cs=1, rs=c_in*9
                 im2col.as_ptr(),
-                1, n_rows as isize,            // rhs [c_in*9, n_rows]: cs=1, rs=n_rows
+                cols_per_row as isize, 1,      // rhs = im2col^T [c_in*9, n_rows]: cs=cols_per_row, rs=1
                 0.0, 1.0,
                 false, false, false,
                 Parallelism::None,
@@ -635,10 +636,9 @@ impl CpuConv2d {
                     for to in 0..t_out {
                         let row = (ib * f_out + fo) * t_out + to;
                         let v = out[c * n_rows + row] + self.bias.as_ref().unwrap()[c];
-                        // GELU(tanh approx): 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x^3)))
-                        let inner = 0.7978845608028654f32 * (v + 0.044715 * v * v * v);
+                        // GELU (exact erf, matching GPU kernel's erff)
                         result[((ib * c_out + c) * f_out + fo) * t_out + to] =
-                            0.5 * v * (1.0 + inner.tanh());
+                            0.5 * v * (1.0 + libm::erff(v * std::f32::consts::FRAC_1_SQRT_2));
                     }
                 }
             }
@@ -787,13 +787,16 @@ impl CpuConvStem {
         // So the same weight applies for every chunk.  Good — we built it once in load.
         let co = self.conv_out.forward(&perm_2d);
         // co: [b*t2, d_model].  Add PE row it (broadcast over b).
+        // Match candle's f16_add: quantise both operands and the result through f16.
         let mut out = co.data.clone();
         for ib in 0..b {
             for it in 0..t2 {
                 let base = (ib * t2 + it) * self.d_model;
                 let pe_base = it * self.d_model;
                 for j in 0..self.d_model {
-                    out[base + j] += self.pe[pe_base + j];
+                    let a = f16::from_f32(out[base + j]).to_f32();
+                    let b = f16::from_f32(self.pe[pe_base + j]).to_f32();
+                    out[base + j] = f16::from_f32(a + b).to_f32();
                 }
             }
         }
@@ -843,23 +846,23 @@ impl CpuAudioAttention {
 
         let scale = 1.0f32 / (hd as f32).sqrt();
         let scores = matmul_qk(&q, &k);  // [1, nh, s, s]
-        let attn = softmax_causal_full(&scores, scale);  // [1, nh, s, s]
-        let attn_out = matmul_av(&attn, &v);  // [1, nh, s, hd] (bytes [1, s, nh, hd])
-        let attn_flat = attn_out.reshape(vec![1, s, dm]);
+        let attn = softmax_scaled(&scores, scale, false);  // full (non-causal) attention for audio encoder
+        let attn_out = matmul_av(&attn, &v);  // [1, nh, s, hd]
+        let attn_flat = swap_dims_12(&attn_out).reshape(vec![1, s, dm]);
         Ok(self.out_proj.forward(&attn_flat))
     }
 }
 
-/// Causal softmax over the last two dims of a 4D [b, nh, s, t] tensor.
-/// t (= n) is the sequence length; row i masks out columns > i.
-/// out [i, j] = exp(in[i, j]*scale - max) / sum;   0 for j > i.
-fn softmax_causal_full(scores: &CpuTensor, scale: f32) -> CpuTensor {
+/// Scaled softmax over the last two dims of a 4D [b, nh, s, t] tensor.
+/// If causal=true, row i masks out columns > i.
+/// out[i, j] = exp(in[i, j]*scale - max) / sum;  0 for j > i (if causal).
+fn softmax_scaled(scores: &CpuTensor, scale: f32, causal: bool) -> CpuTensor {
     let s = scores.shape();
     let (b, nh, sl, t) = (s[0], s[1], s[2], s[3]);
     let mut out = vec![0.0f32; b * nh * sl * t];
     out.par_chunks_mut(t).enumerate().for_each(|(idx, slab)| {
         let i = idx % sl;
-        let valid_t = i + 1;   // causal: see columns [0, i]
+        let valid_t = if causal { i + 1 } else { t };
         let row = &scores.data[idx * t..(idx + 1) * t];
         let mut max_v = f32::NEG_INFINITY;
         for j in 0..valid_t {
@@ -896,14 +899,11 @@ impl CpuAudioFfn {
     }
     fn forward(&self, x: &CpuTensor) -> CpuTensor {
         let mut h = self.fc1.forward(x);
-        // In-place GELU(tanh approx).
-        let n = h.numel();
+        // In-place GELU (exact erf, matching GPU kernel's erff).
         h.data.par_iter_mut().for_each(|v| {
             let x = *v;
-            let inner = 0.7978845608028654f32 * (x + 0.044715 * x * x * x);
-            *v = 0.5 * x * (1.0 + inner.tanh());
+            *v = 0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2));
         });
-        let _ = n;
         self.fc2.forward(&h)
     }
 }
@@ -991,18 +991,17 @@ impl CpuAudioEncoder {
         let mut h = CpuTensor::new(packed, vec![1, n_total, self.d_model]);
 
         // 3. 24 × transformer layers (aligner: full attention, no windowing)
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             h = layer.forward(h)?;
         }
 
         // 4. ln_post → proj1 (GELU) → proj2
         let h = self.ln_post.forward(&h);
         let mut h = self.proj1.forward(&h);
-        // In-place GELU
+        // In-place GELU (exact erf, matching GPU kernel's erff).
         h.data.par_iter_mut().for_each(|v| {
             let x = *v;
-            let inner = 0.7978845608028654f32 * (x + 0.044715 * x * x * x);
-            *v = 0.5 * x * (1.0 + inner.tanh());
+            *v = 0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2));
         });
         let h = self.proj2.forward(&h);
 
@@ -1181,17 +1180,22 @@ pub(crate) fn compute_mrope_cos_sin(
 ) -> (Vec<f32>, Vec<f32>) {
     let hh = hd / 2;
     let sl = pos[0].len();
-    let inv: Vec<f64> = (0..hh).map(|i| 1.0 / rt.powf(2.0 * i as f64 / hd as f64)).collect();
+    // Match candle: f32 inv_freq + f16 round-trip on cos/sin.
+    let inv: Vec<f32> = (0..hh)
+        .map(|i| (rt as f32).powf(-(2.0 * i as f32) / hd as f32))
+        .collect();
     let dm = if il { build_interleaved_dim_map(ms, hh) } else { build_contiguous_dim_map(ms, hh) };
     let mut cv = vec![0.0f32; sl * hd];
     let mut sv = vec![0.0f32; sl * hd];
     for t in 0..sl {
         for j in 0..hh {
-            let a = pos[dm[j]][t] as f64 * inv[j];
-            cv[t * hd + j] = a.cos() as f32;
-            sv[t * hd + j] = a.sin() as f32;
-            cv[t * hd + j + hh] = a.cos() as f32;
-            sv[t * hd + j + hh] = a.sin() as f32;
+            let a = pos[dm[j]][t] as f32 * inv[j];
+            let c = f16::from_f32(a.cos()).to_f32();
+            let s = f16::from_f32(a.sin()).to_f32();
+            cv[t * hd + j] = c;
+            sv[t * hd + j] = s;
+            cv[t * hd + j + hh] = c;
+            sv[t * hd + j + hh] = s;
         }
     }
     (cv, sv)

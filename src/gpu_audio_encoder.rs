@@ -93,7 +93,7 @@ impl GpuAudioAttention {
     /// x [1, s, dm]; windowed attention over chunks of size `ws`.
     fn forward(&self, cuda: &CudaState, x: &GpuTensor, ws: Option<usize>) -> Result<GpuTensor> {
         let dims = x.shape();
-        let b = dims[0]; let s = dims[1]; let _dm = dims[2];
+        let b = dims[0]; let s = dims[1]; let dm = dims[2];
         let nh = self.num_heads; let hd = self.head_dim;
 
         // Project Q, K, V.
@@ -338,8 +338,8 @@ impl GpuAudioEncoder {
 
         // 3. Transformer layers (aligner: full attention, no windowing)
         let mut h = packed_gpu;
-        for layer in &self.layers {
-            h = layer.forward(cuda, h, None)?;   // <-- None = full attention (aligner)
+        for layer in self.layers.iter() {
+            h = layer.forward(cuda, h, None)?;   // None = full attention (aligner)
         }
 
         // 4. Final projection
