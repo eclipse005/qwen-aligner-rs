@@ -13,7 +13,7 @@ CPU 路径用 gemm crate + rayon。
 
 ---
 
-## 当前状态（commit `f0fdff0`）
+## 当前状态（commit `43ae896`）
 
 ### 性能（P104-100, Pascal sm_61, 8GB, 无 tensor core）
 
@@ -24,12 +24,13 @@ CPU 路径用 gemm crate + rayon。
 | CUDA | 15s (EN) | 15s | 0.21s | ~71x |
 | CUDA | 180s (EN) | 180s | 4.69s | **38.4x** |
 | CUDA | ko_4m (KO) | 267s | 4.98s | **53.5x** |
-| CPU | 15s (EN) | 15s | **1.52s** | **9.9x** |
-| CPU | 180s (EN) | 180s | **43.4s** | **4.15x** |
+| CPU | 15s (EN) | 15s | **1.48s** | **10.1x** |
+| CPU | 180s (EN) | 180s | **32.6s** | **5.5x** |
 | CPU | ko_4m (KO) | 267s | ~51s | ~5.2x |
 
-> CPU 数字来自 commit `f0fdff0`（P0-1: f16→f32 预转换）。15s 提升 1.50x，
-> 180s 提升 1.04x。ko_4m 未在此 commit 重测，暂沿用旧值。
+> CPU 数字来自 commit `43ae896`（P0-1 f16→f32 预转换 + P1-2 v2 SIMD prefill_attention）。
+> 180s text_decoder 30.5s → 19.3s (1.58x)；attn 是 180s 上 87% 的 text_decoder
+> 时间，所以 fused/SIMD attention 是最大单点。ko_4m 未在此 commit 重测。
 
 ### 正确性
 
@@ -68,36 +69,33 @@ src/
 | `6f8528d` | **多后端抽象 + CPU f16 权重存储**（RawTensor, backend.rs, Engine enum, PreparedInput） |
 | `bbc6d79` | chore: cleanup dead code, delete handoff.md, add ROADMAP.md |
 | `f0fdff0` | **CPU f16→f32 load-time 预转换** — text_decoder/audio_encoder 权重在 load 时一次性 upcast，热路径无转换。15s: 2.28s→1.52s (1.50x), 180s: 49.5s→43.4s (1.04x) |
+| `a0e51bc` | docs: update ROADMAP with P0-1 results and CPU optimization plan |
+| `f4de5cb` | feat(cpu): add QFA_SUB_PROFILE per-op timing (per-layer per-op print, near-zero cost) |
+| `43ae896` | **CPU prefill_attention SIMD Q@K + A@V (P1-2 v2)** — AVX2+FMA intrinsics on the 2 hot inner loops of the per-head scalar attention. 180s text_decoder 30.5s→19.3s (1.58x), total 43.4s→32.6s (RTFx 5.5x). 15s 1.52s→1.48s. *(v1 用 gemm crate 在 K=128 上反而 3.6x 变慢，已回退)* |
 
 ---
 
-## 下一步规划（按优先级）
+### 1. CPU 性能优化（**进行中** — 已完成 P0-1, P1-0, P1-2 v2，下一个目标是 P2 audio encoder）
 
-### 1. CPU 性能优化（**进行中** — commit `f0fdff0` 是 P0-1，下一个目标是 P1）
-
-当前瓶颈（180s EN 推理 43.4s）：
+当前瓶颈（180s EN 推理 32.6s）：
 
 | 组件 | 耗时 | 占比 | 备注 |
-|------|------|------|------|
-| text_decoder | 30.5s | 70% | 28 层 prefill，单次 forward，无 autoregressive |
-| audio_encoder | 12.6s | 29% | 24 层 + conv stem (3 convs) |
+| text_decoder | **19.3s** | **59%** | 28 层 prefill，P1-2 v2 后 attn 从 ~26s 降到 ~15s |
+| audio_encoder | 12.6s | 39% | 24 层 + conv stem (3 convs) — **P2 下一个目标** |
 | prepare_input | 0.2s | 1% | 已是噪声 |
 
-text_decoder 内 3.8T FMA @ 130 GFLOPs/s 实际（peak 380 GFLOPs/s），**3x off peak**。
-主因是 `gemm` crate 在中等矩阵（sl≈2300 × hidden=1024 × 6144）上有 overhead，
-且 prefill_attention 的 per-head scalar Q@K 不利缓存。
+text_decoder 19.3s 中：4 个 GEMM ~3.5s，attn ~15s，elementwise ~0.8s。
+
+已完成 / 跳过：
+- ✅ P1-0 sub-profile (`f4de5cb`)：诊断出 attn 在 180s 上占 87% text_decoder
+- ✅ P1-2 v1 gemm crate 替换：rejected（K=128 skinny matmul 反而 3.6x 变慢）
+- ✅ P1-2 v2 AVX2+FMA SIMD (`43ae896`)：attn 26s → 15s, text_decoder 1.58x
 
 下一步：
-- **P1-0: CPU sub-profile**（仿照 CUDA 的 QFA_SUB_PROFILE，CPU 路径尚未实现）确认 per-op 真实占比
-- **P1-1: matrixmultiply crate 直替 gemm crate**（去掉 wrapper 开销，预期 1.3-1.8x）
-- **P1-2: fused attention pass**（Q@K+mask+softmax+@V 一次 tile，预估 1.5-2x on attn）
-- **P2: audio encoder 并行化**（跨 chunk + conv stem SIMD）
-- **P3: MLP 融合**（silu_mul+down_proj 中间张量消除）
-
-### 2. CUDA 性能优化（目标 RTFx > 50 on 180s EN）
-
-当前瓶颈（180s EN 推理 4.69s）：
-
+- **P2-1: Conv stem SIMD + 并行化**（12.6s 中的 3 个 conv + GELU + permute 1-2s，估 1.5-2x on audio_encoder）
+- **P2-2: Audio encoder 跨层并行**（24 层串行，估 1.3-1.5x on audio_encoder）
+- **P1-1: matrixmultiply crate 直替 gemm crate**（4 个 GEMM ~3.5s，估 1.2-1.5x on text_decoder）
+- **P3-1: MLP 融合**（silu_mul+down_proj 中间张量消除，估 5-10% on text_decoder）
 | 组件 | 耗时 | 占比 |
 |------|------|------|
 | text_decoder | 3.19s | 68% |
