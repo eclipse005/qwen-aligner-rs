@@ -86,6 +86,20 @@ impl CpuWeightF16 {
         let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
         CpuWeight { data, rows: self.rows, cols: self.cols }
     }
+
+    /// Consuming f16→f32 with rayon. Use at load time to hoist conversion out
+    /// of the hot loop. The 0.6B model costs ~1.2 GB extra RAM, but eliminates
+    /// repeated per-call conversions (text decoder: ~250 calls per forward).
+    pub(crate) fn into_f32(self) -> CpuWeight {
+        let data: Vec<f32> = self.data.into_par_iter().map(|v| v.to_f32()).collect();
+        CpuWeight { data, rows: self.rows, cols: self.cols }
+    }
+
+    /// Borrowing f16→f32 with rayon (for cases where we still need the f16).
+    pub(crate) fn to_f32_par(&self) -> CpuWeight {
+        let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
+        CpuWeight { data, rows: self.rows, cols: self.cols }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -613,7 +627,8 @@ fn prefill_attention(
 // ─── Conv stem ──────────────────────────────────────────────────────
 
 struct CpuConv2d {
-    weight: CpuWeightF16,   // [c_out, c_in, kh, kw]
+    /// Weight stored as f32 (pre-converted at load time).
+    weight: CpuWeight,   // [c_out, c_in*9] (im2col-friendly layout)
     bias: Option<Vec<f32>>,
     in_channels: usize,
     out_channels: usize,
@@ -633,12 +648,9 @@ impl CpuConv2d {
         } else {
             None
         };
-        Ok(Self {
-            weight: CpuWeightF16 { data: w, rows: c_out, cols: c_in * 9 },
-            bias,
-            in_channels: c_in,
-            out_channels: c_out,
-        })
+        // Convert f16 → f32 at load time (one-time cost).
+        let weight = CpuWeightF16 { data: w, rows: c_out, cols: c_in * 9 }.into_f32();
+        Ok(Self { weight, bias, in_channels: c_in, out_channels: c_out })
     }
 
     /// x: [b, c_in, f, t] NCHW  →  out: [b, c_out, f_out, t_out]
@@ -687,13 +699,8 @@ impl CpuConv2d {
             }
         }
         // gemm: W is [c_out, c_in*9] (row-major).  Compute y = W @ X → [c_out, n_rows].
-        // Use gemm crate with non-parallel (im2col is already parallelised via outer loop,
-        // and the matmul dims are small enough that single-threaded gemm is fine here).
-        // gemm API: gemm(m, n, k, c_ptr, c_cs, c_rs, transpose_c, a_ptr, a_cs, a_rs,
-        //                              b_ptr, b_cs, b_rs, beta, alpha, ...).
-        // For row-major [m, k] matrix, cs (column stride) = 1, rs (row stride) = k.
-        // Convert f16 weight to f32 for gemm (audio encoder: many small layers, sequential is fine).
-        let w_f32 = self.weight.to_f32();
+        // Weight is already f32 (pre-converted at load time).
+        let w = &self.weight;
         let mut out = vec![0.0f32; c_out * n_rows];
         unsafe {
             gemm(
@@ -701,7 +708,7 @@ impl CpuConv2d {
                 out.as_mut_ptr(),
                 1, n_rows as isize,            // dst [c_out, n_rows]: cs=1, rs=n_rows
                 false,
-                w_f32.data.as_ptr(),
+                w.data.as_ptr(),
                 1, cols_per_row as isize,      // lhs [c_out, c_in*9]: cs=1, rs=c_in*9
                 im2col.as_ptr(),
                 cols_per_row as isize, 1,      // rhs = im2col^T [c_in*9, n_rows]: cs=cols_per_row, rs=1
@@ -733,7 +740,8 @@ impl CpuConv2d {
 }
 
 struct CpuLinear {
-    weight: CpuWeightF16,   // [out, in]
+    /// Weight stored as f32 (pre-converted at load time).
+    weight: CpuWeight,   // [out, in]
     bias: Option<Vec<f32>>,
 }
 
@@ -746,14 +754,15 @@ impl CpuLinear {
         } else {
             None
         };
-        Ok(Self { weight: CpuWeightF16 { data: w, rows: ws[0], cols: ws[1] }, bias })
+        // Convert f16 → f32 at load time.
+        let weight = CpuWeightF16 { data: w, rows: ws[0], cols: ws[1] }.into_f32();
+        Ok(Self { weight, bias })
     }
 
     /// x: [..., in_dim]  →  out: [..., out_dim]
-    /// Audio encoder: convert f16→f32 then use f32 gemm.
+    /// Audio encoder: weight is already f32 (pre-converted at load time).
     fn forward(&self, x: &CpuTensor) -> CpuTensor {
-        let w_f32 = self.weight.to_f32();
-        let mut y = linear(x, &w_f32);
+        let mut y = linear(x, &self.weight);
         // Bias add — broadcast bias over all leading dims.  Some linears
         // (e.g. conv_out in the audio tower) have no bias.
         if let Some(bias) = &self.bias {
@@ -1122,19 +1131,21 @@ impl CpuKvCache {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+// ─── Decoder layer ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 //  Decoder layer
-// ═══════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════
 
 pub(crate) struct CpuDecoderLayer {
     pub iln_w: Vec<f32>,
     pub pln_w: Vec<f32>,
     pub qn_w: Vec<f32>,
     pub kn_w: Vec<f32>,
-    pub qkv_w: CpuWeightF16,
-    pub o_w: CpuWeightF16,
-    pub gu_w: CpuWeightF16,
-    pub dp_w: CpuWeightF16,
+    /// All matmul weights pre-converted to f32 at load time (eliminates
+    /// per-call f16→f32 in the hot loop).  Memory cost: +1.2 GB for 0.6B model.
+    pub qkv_w: CpuWeight,
+    pub o_w: CpuWeight,
+    pub gu_w: CpuWeight,
+    pub dp_w: CpuWeight,
     pub nqh: usize, pub nkvh: usize, pub hd: usize, pub eps: f32,
 }
 
@@ -1145,10 +1156,10 @@ impl CpuDecoderLayer {
             pln_w: load_vec(weights, &format!("{}.post_attention_layernorm.weight", prefix))?,
             qn_w: load_vec(weights, &format!("{}.self_attn.q_norm.weight", prefix))?,
             kn_w: load_vec(weights, &format!("{}.self_attn.k_norm.weight", prefix))?,
-            qkv_w: load_fused_qkv_f16(weights, &format!("{}.self_attn", prefix))?,
-            o_w: load_weight_f16(weights, &format!("{}.self_attn.o_proj.weight", prefix))?,
-            gu_w: load_fused_gate_up_f16(weights, &format!("{}.mlp", prefix))?,
-            dp_w: load_weight_f16(weights, &format!("{}.mlp.down_proj.weight", prefix))?,
+            qkv_w: load_fused_qkv_f16(weights, &format!("{}.self_attn", prefix))?.into_f32(),
+            o_w: load_weight_f16(weights, &format!("{}.self_attn.o_proj.weight", prefix))?.into_f32(),
+            gu_w: load_fused_gate_up_f16(weights, &format!("{}.mlp", prefix))?.into_f32(),
+            dp_w: load_weight_f16(weights, &format!("{}.mlp.down_proj.weight", prefix))?.into_f32(),
             nqh: cfg.num_attention_heads,
             nkvh: cfg.num_key_value_heads,
             hd: cfg.head_dim,
@@ -1166,7 +1177,7 @@ impl CpuDecoderLayer {
     ) -> CpuTensor {
         let b = x.shape[0]; let s = x.shape[1];
         let normed = rms_norm(&x, &self.iln_w, self.eps);
-        let qkv = linear_f16(&normed, &self.qkv_w);
+        let qkv = linear(&normed, &self.qkv_w);
         drop(normed);
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
@@ -1188,15 +1199,15 @@ impl CpuDecoderLayer {
         // Reshape directly to [b, s, nqh*hd] for the O projection (no swap needed).
         let attn_flat = attn_out.reshape(vec![b, s, self.nqh * self.hd]);
         let mut h = x;
-        linear_accum_f16(&mut h, &attn_flat, &self.o_w);
+        linear_accum(&mut h, &attn_flat, &self.o_w);
         drop(attn_flat);
 
         let normed2 = rms_norm(&h, &self.pln_w, self.eps);
-        let gu = linear_f16(&normed2, &self.gu_w);
+        let gu = linear(&normed2, &self.gu_w);
         drop(normed2);
         let activated = silu_mul_split(&gu);
         drop(gu);
-        linear_accum_f16(&mut h, &activated, &self.dp_w);
+        linear_accum(&mut h, &activated, &self.dp_w);
         h
     }
 }
@@ -1206,8 +1217,10 @@ impl CpuDecoderLayer {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub(crate) struct CpuTextDecoder {
-    pub embed_table: CpuWeightF16,
-    pub lm_head: CpuWeightF16,
+    /// Embedding table stored as f32 (pre-converted at load time).
+    pub embed_table: CpuWeight,
+    /// LM head stored as f32 (pre-converted at load time).
+    pub lm_head: CpuWeight,
     pub layers: Vec<CpuDecoderLayer>,
     pub norm_w: Vec<f32>,
     pub eps: f32,
@@ -1215,8 +1228,8 @@ pub(crate) struct CpuTextDecoder {
 
 impl CpuTextDecoder {
     pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextConfig) -> Result<Self> {
-        let embed_table = load_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
-        let lm_head = load_weight_f16(weights, "thinker.lm_head.weight")?;
+        let embed_table = load_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?.into_f32();
+        let lm_head = load_weight_f16(weights, "thinker.lm_head.weight")?.into_f32();
         let norm_w = load_vec(weights, &format!("{}.norm.weight", prefix))?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -1225,7 +1238,8 @@ impl CpuTextDecoder {
         Ok(Self { embed_table, lm_head, layers, norm_w, eps: config.rms_norm_eps as f32 })
     }
 
-    /// Embed ids into [n, hidden] CpuTensor (f32). Converts f16 rows to f32 on the fly.
+    /// Embed ids into [n, hidden] CpuTensor (f32). The embed table is already
+    /// f32 (pre-converted at load), so this is a straight copy of the row.
     pub fn embed_ids(&self, ids: &[i64]) -> CpuTensor {
         let hidden = self.embed_table.cols;
         let n = ids.len();
@@ -1233,9 +1247,7 @@ impl CpuTextDecoder {
         data.par_chunks_mut(hidden).enumerate().for_each(|(i, slab)| {
             let row = ids[i] as usize;
             let src = &self.embed_table.data[row * hidden..(row + 1) * hidden];
-            for (j, v) in slab.iter_mut().enumerate() {
-                *v = src[j].to_f32();
-            }
+            slab.copy_from_slice(src);
         });
         CpuTensor::new(data, vec![n, hidden])
     }
@@ -1260,8 +1272,8 @@ impl CpuTextDecoder {
         // Final RMSNorm (aligner wants the full [1, sl, hidden] back, not last-token).
         let h = rms_norm(&h, &self.norm_w, self.eps);
         // lm_head: y = h @ W^T  where h is [1, sl, hidden], W is [classify_num, hidden].
-        // m=sl which is > 1 in prefill, so use linear_f16() (the gemm path).
-        linear_f16(&h, &self.lm_head)
+        // m=sl which is > 1 in prefill, so use linear() (the gemm path).
+        linear(&h, &self.lm_head)
     }
 }
 
