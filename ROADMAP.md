@@ -12,10 +12,9 @@ CPU 路径用 gemm crate + rayon。
 姊妹项目：`D:\qwen3-asr`（同架构 ASR 模型，已做完类似抽象）。
 
 ---
+## 当前状态（commit `7633431`）
 
-## 当前状态（commit `43ae896`）
-
-### 性能（P104-100, Pascal sm_61, 8GB, 无 tensor core）
+### 性能（P104-100, Pascal sm_61, 8GB, 无 tensor core / Arrow Lake 24c AVX2+FMA）
 
 纯推理时间（不含 ~5s 模型加载）：
 
@@ -24,15 +23,15 @@ CPU 路径用 gemm crate + rayon。
 | CUDA | 15s (EN) | 15s | 0.21s | ~71x |
 | CUDA | 180s (EN) | 180s | 4.69s | **38.4x** |
 | CUDA | ko_4m (KO) | 267s | 4.98s | **53.5x** |
-| CPU | 15s (EN) | 15s | **1.48s** | **10.1x** |
-| CPU | 180s (EN) | 180s | **32.6s** | **5.5x** |
-| CPU | ko_4m (KO) | 267s | ~51s | ~5.2x |
+| CPU | 15s (EN) | 15s | **1.22s** | **12.3x** |
+| CPU | 180s (EN) | 180s | **29.9s** | **6.0x** |
+| CPU | ko_4m (KO) | 267s | ~50s | ~5.3x |
 
-> CPU 数字来自 commit `43ae896`（P0-1 f16→f32 预转换 + P1-2 v2 SIMD prefill_attention）。
-> 180s text_decoder 30.5s → 19.3s (1.58x)；attn 是 180s 上 87% 的 text_decoder
-> 时间，所以 fused/SIMD attention 是最大单点。ko_4m 未在此 commit 重测。
-
-### 正确性
+> CPU 数字来自 commit `7633431`（P0-1 + P1-2 v2 + P2-1 v1）。本会话相对 P0 之前的 baseline (CPU 15s 2.28s / 180s 49.5s) 提速：15s 1.87x，180s 1.66x。
+> P2-1 v1 把 audio_encoder 12.5s → 9.2s (1.36x)，主要靠 conv stem 8x (3 个 conv + bias+GELU)：
+> gemm crate 5.6s → SIMD AVX2+FMA 1-row matmul + parallel bias+GELU → 3.3s (180s conv2)，conv1 0.9s → 0.2s，conv3 1.4s → 0.7s。
+> 进一步缩 conv2 matmul 试过 4-row + (c_out_chunk, row_block) 并行，没改善（甚至微回归，cache 压力更大），
+> 试过 8-row 同样。skinny matmul (m=30, k=270, n=144K) 的 gemm 已是甜点，要继续压需要 NHWC + direct conv。
 
 - CUDA: 所有 fixture 与重构前 candle baseline 完全一致（15s 40/40, 180s 909/909, ko_4m 189/189）
 - CPU: 15s 40/40 与 CUDA 一致；180s/ko_4m 有 CPU 音频编码器边界处理的已知微小差异
@@ -69,47 +68,60 @@ src/
 | `6f8528d` | **多后端抽象 + CPU f16 权重存储**（RawTensor, backend.rs, Engine enum, PreparedInput） |
 | `bbc6d79` | chore: cleanup dead code, delete handoff.md, add ROADMAP.md |
 | `f0fdff0` | **CPU f16→f32 load-time 预转换** — text_decoder/audio_encoder 权重在 load 时一次性 upcast，热路径无转换。15s: 2.28s→1.52s (1.50x), 180s: 49.5s→43.4s (1.04x) |
-| `a0e51bc` | docs: update ROADMAP with P0-1 results and CPU optimization plan |
 | `f4de5cb` | feat(cpu): add QFA_SUB_PROFILE per-op timing (per-layer per-op print, near-zero cost) |
 | `43ae896` | **CPU prefill_attention SIMD Q@K + A@V (P1-2 v2)** — AVX2+FMA intrinsics on the 2 hot inner loops of the per-head scalar attention. 180s text_decoder 30.5s→19.3s (1.58x), total 43.4s→32.6s (RTFx 5.5x). 15s 1.52s→1.48s. *(v1 用 gemm crate 在 K=128 上反而 3.6x 变慢，已回退)* |
+| `11bb061` | docs: update ROADMAP with P1-2 v2 results and P2 reordering |
+| `51cae2f` | feat(cpu): add audio FFN + LayerNorm sub-profile (audio_encoder sub-stage timing) |
+| `0f4799a` | feat(cpu): add CpuConvStem sub-profile (per-conv + perm + conv_out + PE timing) |
+| `7633431` | **CPU conv stem SIMD + parallel bias+GELU (P2-1 v1)** — 替换 gemm crate 的 5.6s conv2 matmul (180s) 为 8-wide AVX2+FMA 1-row kernel，权重 load-time 转置到 [c_in*9, c_out] 让 8 c_out SIMD load 连续；bias+GELU 改 rayon 并行消灭 4.32M scalar libm::erff。180s: conv stem 7.95s→4.5s (1.76x), audio_encoder 12.5s→9.2s (1.36x), total 30.2s→28.6s (RTFx 5.96→6.0x). 15s 1.48s→1.19s (1.24x). *4-row kernel 试过反而微回归（im2col cache 压力）；要继续缩 conv2 需 NHWC + direct conv 大改* |
 
----
+### 1. CPU 性能优化（**进行中** — 越快越好，无预设上限）
 
-### 1. CPU 性能优化（**进行中** — 已完成 P0-1, P1-0, P1-2 v2，下一个目标是 P2 audio encoder）
-
-当前瓶颈（180s EN 推理 32.6s）：
+当前瓶颈（180s EN 推理 ~29.9s，commit `7633431`）：
 
 | 组件 | 耗时 | 占比 | 备注 |
-| text_decoder | **19.3s** | **59%** | 28 层 prefill，P1-2 v2 后 attn 从 ~26s 降到 ~15s |
-| audio_encoder | 12.6s | 39% | 24 层 + conv stem (3 convs) — **P2 下一个目标** |
-| prepare_input | 0.2s | 1% | 已是噪声 |
+| text_decoder | **~19.5s** | **~65%** | 28 层 prefill；P1-2 v2 后 attn ~15s，4 GEMM ~3.5s，elementwise ~1s |
+| audio_encoder | **~9.2s** | **~31%** | P2-1 v1 后 conv stem 4.5s（conv2 matmul 3.3s 仍瓶颈）+ 24 音频层 ~3.0s + conv_out+PE ~0.06s |
+| prepare_input | 0.2s | <1% | 已是噪声 |
 
-text_decoder 19.3s 中：4 个 GEMM ~3.5s，attn ~15s，elementwise ~0.8s。
+audio_encoder 9.2s 内部分解（commit `0f4799a` + `7633431`）：
+| 子阶段 | 耗时 | 备注 |
+|--------|------|------|
+| conv1 | 0.15s | c_in=1，cache 友好 |
+| **conv2** | **3.3s** | m=30, n=144K, k=270 — gemm crate / SIMD 1-row 都是这数，skinny matmul 极限 |
+| conv3 | 0.7s | m=30, n=36K, k=270 |
+| perm | 0.02s | |
+| conv_out + PE | 0.06s | |
+| 24 音频层 (LN + attn + ffn) | ~3.0s | attn 2.0s + ffn 1.0s |
 
 已完成 / 跳过：
-- ✅ P1-0 sub-profile (`f4de5cb`)：诊断出 attn 在 180s 上占 87% text_decoder
-- ✅ P1-2 v1 gemm crate 替换：rejected（K=128 skinny matmul 反而 3.6x 变慢）
+- ✅ P0-1 f16→f32 预转换 (`f0fdff0`)：text_decoder/audio_encoder 一次 upcast，热路径纯 f32
+- ✅ P0-2 elementwise SIMD：**跳过**（elementwise <5% 总时间）
+- ✅ P1-0 sub-profile (`f4de5cb`)：诊断出 attn 87% text_decoder
+- ✅ P1-1 matrixmultiply crate：**跳过**（K=128 skinny matmul 跟 P1-2 v1 同样风险，gemm 已是甜点）
+- ✅ P1-2 v1 gemm crate 替换 prefill_attention：rejected（K=128 反而 3.6x 慢）
 - ✅ P1-2 v2 AVX2+FMA SIMD (`43ae896`)：attn 26s → 15s, text_decoder 1.58x
+- ✅ P2-0 audio FFN+LN sub-profile (`51cae2f`)：24 层 ~126ms/层 = 3.0s
+- ✅ P2-0.5 conv stem sub-profile (`0f4799a`)：conv2 是 9.2s 中 3.3s
+- ✅ P2-1 v1 conv stem SIMD + parallel GELU (`7633431`)：conv stem 7.95s→4.5s (1.76x)，4-row 试过反而微回归（im2col cache 压力）
 
-下一步：
-- **P2-1: Conv stem SIMD + 并行化**（12.6s 中的 3 个 conv + GELU + permute 1-2s，估 1.5-2x on audio_encoder）
-- **P2-2: Audio encoder 跨层并行**（24 层串行，估 1.3-1.5x on audio_encoder）
-- **P1-1: matrixmultiply crate 直替 gemm crate**（4 个 GEMM ~3.5s，估 1.2-1.5x on text_decoder）
+下一步（按 ROI 排序）：
+- **NHWC + direct conv**（conv stem 进一步压到 ~0.5s 的唯一办法，估 audio_encoder → ~5.5s，total 180s → ~25s，RTFx ~7.2x）
 - **P3-1: MLP 融合**（silu_mul+down_proj 中间张量消除，估 5-10% on text_decoder）
-| 组件 | 耗时 | 占比 |
-|------|------|------|
-| text_decoder | 3.19s | 68% |
-| audio_encoder | 1.25s | 27% |
-| prepare_input | 0.19s | 4% |
+- **P2-2: 跨 chunk 并行**（音频 encoder chunk 维并行，但需 conv stem 改 NHWC 后才有效）
+
+### 2. CUDA 性能优化（**进行中** — 越快越好，无预设上限）
+
+当前瓶颈（180s EN 推理 4.69s）：
 
 可能方向：
+
 - **Conv stem GPU permute**：消除 download→permute→upload 的 CPU roundtrip（~0.05-0.1s）。注意不要用自定义 kernel 做 copy（实测 cudarc launch overhead 很大）
 - **Grouped GQA 单次 GEMM**：当前 8×batch=2 小 GEMM，探索用单次 batch=16 + stride 实现
 - **cuBLAS GEMM 算法搜索**：对常用形状跑 algo0-6 选最优（预估 5-15%）
 - **MLP 融合**：silu_mul_split + down_proj 之间的中间张量消除
 
 ### 3. voxtrans 接入
-
 `D:\voxtrans` 的 `asr_align.rs` 需要约 3 行改动：
 - 删 `DTypeRequest`（cudarc 强制 f16，CPU 自己决定）
 - `Cargo.toml` 改 git URL 指到 `qwen-forced-aligner-rs` repo
