@@ -867,7 +867,12 @@ impl CpuLayerNorm {
         })
     }
     fn forward(&self, x: &CpuTensor) -> CpuTensor {
-        layer_norm(x, &self.weight, &self.bias, self.eps)
+        let t = sub_t0();
+        let y = layer_norm(x, &self.weight, &self.bias, self.eps);
+        if sub_profile_enabled() {
+            eprintln!("    layer_norm ({}) dt={:.1} ms", x.shape[0] * x.shape[1], sub_ms(t));
+        }
+        y
     }
 }
 
@@ -1079,13 +1084,22 @@ impl CpuAudioFfn {
         })
     }
     fn forward(&self, x: &CpuTensor) -> CpuTensor {
+        let t = sub_t0();
         let mut h = self.fc1.forward(x);
-        // In-place GELU (exact erf, matching GPU kernel's erff).
+        let dt_fc1 = sub_ms(t);
+        let t = sub_t0();
         h.data.par_iter_mut().for_each(|v| {
             let x = *v;
             *v = 0.5 * x * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2));
         });
-        self.fc2.forward(&h)
+        let dt_gelu = sub_ms(t);
+        let t = sub_t0();
+        let out = self.fc2.forward(&h);
+        let dt_fc2 = sub_ms(t);
+        if sub_profile_enabled() {
+            eprintln!("    audio_ffn  fc1={:.1} gelu={:.1} fc2={:.1} ms", dt_fc1, dt_gelu, dt_fc2);
+        }
+        out
     }
 }
 
