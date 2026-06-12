@@ -31,6 +31,26 @@ use std::collections::HashMap;
 
 use crate::config::{AudioConfig, TextConfig};
 use crate::raw_tensor::RawTensor;
+// ─── Sub-profile helpers (mirrors CUDA's QFA_SUB_PROFILE) ─────────────────────
+// QFA_SUB_PROFILE=1: print per-op time per layer for text decoder and
+// per-section time for audio encoder.  Zero overhead when env var is unset
+// (Option<Instant> branch is inlined and skipped).
+
+static SUB_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn sub_profile_enabled() -> bool {
+    *SUB_PROFILE.get_or_init(|| std::env::var_os("QFA_SUB_PROFILE").is_some())
+}
+
+#[inline(always)]
+fn sub_t0() -> Option<std::time::Instant> {
+    if sub_profile_enabled() { Some(std::time::Instant::now()) } else { None }
+}
+
+#[inline(always)]
+fn sub_ms(t0: Option<std::time::Instant>) -> f64 {
+    match t0 { Some(t) => t.elapsed().as_secs_f64() * 1000.0, None => 0.0 }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Host-side f32 tensors
@@ -931,9 +951,11 @@ impl CpuAudioAttention {
         let nh = self.num_heads;
         let hd = self.head_dim;
 
+        let t = sub_t0();
         let q = self.q_proj.forward(x);
         let k = self.k_proj.forward(x);
         let v = self.v_proj.forward(x);
+        let dt_qkv = sub_ms(t);
 
         // Reshape [1, s, dm] → [1, s, nh, hd] and transpose to [1, nh, s, hd].
         let q = swap_dims_12(&q.reshape(vec![1, s, nh, hd]));
@@ -941,11 +963,21 @@ impl CpuAudioAttention {
         let v = swap_dims_12(&v.reshape(vec![1, s, nh, hd]));
 
         let scale = 1.0f32 / (hd as f32).sqrt();
+        let t = sub_t0();
         let scores = matmul_qk(&q, &k);  // [1, nh, s, s]
         let attn = softmax_scaled(&scores, scale, false);  // full (non-causal) attention for audio encoder
         let attn_out = matmul_av(&attn, &v);  // [1, nh, s, hd]
+        let dt_attn = sub_ms(t);
+        let t = sub_t0();
         let attn_flat = swap_dims_12(&attn_out).reshape(vec![1, s, dm]);
-        Ok(self.out_proj.forward(&attn_flat))
+        let dt_post = sub_ms(t);
+        let t_out = sub_t0();
+        let out = self.out_proj.forward(&attn_flat);
+        if sub_profile_enabled() {
+            eprintln!("    audio_attn qkv={:.1} attn={:.1} post={:.1} out={:.1} ms",
+                dt_qkv, dt_attn, dt_post, sub_ms(t_out));
+        }
+        Ok(out)
     }
 }
 
@@ -1176,38 +1208,62 @@ impl CpuDecoderLayer {
         kv_start: usize, use_causal: bool,
     ) -> CpuTensor {
         let b = x.shape[0]; let s = x.shape[1];
+
+        let t = sub_t0();
         let normed = rms_norm(&x, &self.iln_w, self.eps);
+        let dt_rmsn = sub_ms(t);
+
+        let t = sub_t0();
         let qkv = linear(&normed, &self.qkv_w);
+        let dt_qkv = sub_ms(t);
         drop(normed);
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
 
+        let t = sub_t0();
         let q = qkv_extract_qkv_norm_rotary_cache(
             &qkv, &self.qn_w, &self.kn_w, cos_table, sin_table,
             &mut kv.k[layer_idx], &mut kv.v[layer_idx],
             b, self.nqh, self.nkvh, self.hd, q_dim, kv_dim,
             kv.max_seq, kv_start, kv_start, self.eps,
         );
+        let dt_qkv_prep = sub_ms(t);
         drop(qkv);
         let cur_len = kv_start + s;
 
+        let t = sub_t0();
         let attn_out = prefill_attention(
             &q, &kv.k[layer_idx], &kv.v[layer_idx],
             b, self.nqh, self.nkvh, kv.max_seq, self.hd, cur_len, use_causal,
         );
+        let dt_attn = sub_ms(t);
         // attn_out is laid out as [b, nqh, s, hd] (logical) but bytes are [b, s, nqh, hd].
         // Reshape directly to [b, s, nqh*hd] for the O projection (no swap needed).
         let attn_flat = attn_out.reshape(vec![b, s, self.nqh * self.hd]);
         let mut h = x;
+        let t = sub_t0();
         linear_accum(&mut h, &attn_flat, &self.o_w);
+        let dt_o = sub_ms(t);
         drop(attn_flat);
 
+        let t = sub_t0();
         let normed2 = rms_norm(&h, &self.pln_w, self.eps);
+        let dt_rmsn2 = sub_ms(t);
+
+        let t = sub_t0();
         let gu = linear(&normed2, &self.gu_w);
+        let dt_gu = sub_ms(t);
         drop(normed2);
         let activated = silu_mul_split(&gu);
         drop(gu);
+        let t = sub_t0();
         linear_accum(&mut h, &activated, &self.dp_w);
+        let dt_dp = sub_ms(t);
+
+        if sub_profile_enabled() {
+            eprintln!("  text_dec.layer[{:02}] rmsn={:.1} qkv={:.1} qkv_prep={:.1} attn={:.1} o={:.1} rmsn2={:.1} gu={:.1} dp={:.1} ms",
+                layer_idx, dt_rmsn, dt_qkv, dt_qkv_prep, dt_attn, dt_o, dt_rmsn2, dt_gu, dt_dp);
+        }
         h
     }
 }
@@ -1270,10 +1326,18 @@ impl CpuTextDecoder {
         kv.cur_len = kv_start + sl;
 
         // Final RMSNorm (aligner wants the full [1, sl, hidden] back, not last-token).
+        let t = sub_t0();
         let h = rms_norm(&h, &self.norm_w, self.eps);
+        let dt_final_rmsn = sub_ms(t);
         // lm_head: y = h @ W^T  where h is [1, sl, hidden], W is [classify_num, hidden].
         // m=sl which is > 1 in prefill, so use linear() (the gemm path).
-        linear(&h, &self.lm_head)
+        let t = sub_t0();
+        let logits = linear(&h, &self.lm_head);
+        let dt_lm_head = sub_ms(t);
+        if sub_profile_enabled() {
+            eprintln!("  text_dec.tail  final_rmsn={:.1} lm_head={:.1} ms", dt_final_rmsn, dt_lm_head);
+        }
+        logits
     }
 }
 
