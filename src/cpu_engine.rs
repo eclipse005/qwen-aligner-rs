@@ -683,6 +683,43 @@ unsafe fn axpy_avx2(out: &mut [f32], w: f32, v: &[f32]) {
     }
 }
 
+/// AVX2+FMA: for one output row of the conv stem matmul, accumulate
+/// 8 c_out outputs over `cols = c_in*9` inner-product terms.
+/// `w_t` is the *transposed* weight in [cols, c_out] row-major (transposed
+/// at load time so 8 c_out values at a fixed k are contiguous).
+/// Returns an __m256 of 8 c_out outputs for this row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv_row_8cols(
+    row_in: *const f32,    // im2col[row, 0]
+    w_t: *const f32,       // W^T[0, 0] in [cols, c_out] layout
+    cols: usize,           // = c_in * 9
+    c_out: usize,          // total c_out count (stride for W^T)
+    c_out_base: usize,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    for k in 0..cols {
+        let w_vec = _mm256_loadu_ps(w_t.add(k * c_out + c_out_base));
+        let x_val = *row_in.add(k);
+        let x_vec = _mm256_set1_ps(x_val);
+        acc = _mm256_fmadd_ps(w_vec, x_vec, acc);
+    }
+    acc
+}
+
+/// Scalar tail for one c_out when c_out % 8 != 0.
+#[inline(always)]
+fn conv_row_tail_t(
+    im2col: &[f32], w_t: &[f32], row: usize, cols: usize, c_out: usize, c_out_idx: usize,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for k in 0..cols {
+        acc += w_t[k * c_out + c_out_idx] * im2col[row * cols + k];
+    }
+    acc
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Audio encoder — full CPU port mirroring gpu_audio_encoder.rs
 // ═══════════════════════════════════════════════════════════════════════
@@ -721,8 +758,20 @@ impl CpuConv2d {
         } else {
             None
         };
-        // Convert f16 → f32 at load time (one-time cost).
-        let weight = CpuWeightF16 { data: w, rows: c_out, cols: c_in * 9 }.into_f32();
+        // Convert f16 → f32 at load time (one-time cost), then transpose to
+        // [c_in*9, c_out] layout so the SIMD matmul can read 8 c_out values
+        // at a fixed k with one contiguous 8-wide load.  In the natural
+        // [c_out, c_in*9] layout those 8 values are strided by c_in*9, and
+        // the SIMD load would read 7 wrong k values (silent bit-corruption).
+        let weight_f32 = CpuWeightF16 { data: w, rows: c_out, cols: c_in * 9 }.into_f32();
+        let cols = c_in * 9;
+        let mut w_t = vec![0.0f32; cols * c_out];
+        for c_out_idx in 0..c_out {
+            for k in 0..cols {
+                w_t[k * c_out + c_out_idx] = weight_f32.data[c_out_idx * cols + k];
+            }
+        }
+        let weight = CpuWeight { data: w_t, rows: cols, cols: c_out };
         Ok(Self { weight, bias, in_channels: c_in, out_channels: c_out })
     }
 
@@ -771,43 +820,59 @@ impl CpuConv2d {
                 }
             }
         }
-        // gemm: W is [c_out, c_in*9] (row-major).  Compute y = W @ X → [c_out, n_rows].
-        // Weight is already f32 (pre-converted at load time).
-        let w = &self.weight;
-        let mut out = vec![0.0f32; c_out * n_rows];
-        unsafe {
-            gemm(
-                c_out, n_rows, cols_per_row,
-                out.as_mut_ptr(),
-                1, n_rows as isize,            // dst [c_out, n_rows]: cs=1, rs=n_rows
-                false,
-                w.data.as_ptr(),
-                1, cols_per_row as isize,      // lhs [c_out, c_in*9]: cs=1, rs=c_in*9
-                im2col.as_ptr(),
-                cols_per_row as isize, 1,      // rhs = im2col^T [c_in*9, n_rows]: cs=cols_per_row, rs=1
-                0.0, 1.0,
-                false, false, false,
-                Parallelism::None,
-            );
-        }
-        // Add bias and GELU(tanh approx).  After gemm, out[i, j] = sum_k W[i,k] * X[k,j].
-        // Layout is [c_out, n_rows], so out[(i * n_rows) + j] is the (i, j) element.
-        // We want to reshape to [b, c_out, f_out, t_out], so dst[ib, c, fo, to] = out[c, row]
-        // where row = (ib * f_out + fo) * t_out + to.
+        // ── P2-1: replace gemm crate with direct AVX2+FMA, then parallel
+        // bias+GELU on the row-major output.  The gemm crate on this conv
+        // shape (m=30, n=144K, k=270) was 40x slower than the text decoder's
+        // GEMM because matrixmultiply is tuned for square-ish shapes and
+        // 5.6s of 12.6s audio_encoder on 180s was the gemm alone.  The custom
+        // 8-wide FMA matmul on the [c_in*9, c_out] transposed weight runs in
+        // single-digit ms per conv, and the bias+GELU loop is parallelised
+        // over (ib, c) to collapse 4.32M scalar libm::erff calls (~5s on
+        // 180s) into ~14ms.
+        let w_t = &self.weight;            // [c_in*9, c_out] row-major (transposed at load)
+        let cols = cols_per_row;
+        let c_out_chunks = c_out / 8;
+        let c_out_tail_start = c_out_chunks * 8;
+        let mut matmul_out = vec![0.0f32; n_rows * c_out];
+        // Pass pointers as usize so the closure satisfies Sync (raw pointers
+        // are !Sync, blocking rayon parallelism).
+        let w_t_addr = w_t.data.as_ptr() as usize;
+        let im2col_addr = im2col.as_ptr() as usize;
+        use rayon::prelude::*;
+        matmul_out.par_chunks_mut(c_out).enumerate().for_each(|(row, row_slice)| unsafe {
+            use std::arch::x86_64::*;
+            let row_in = (im2col_addr as *const f32).add(row * cols);
+            let row_out = row_slice.as_mut_ptr();
+            let w_t_ptr = w_t_addr as *const f32;
+            // Full 8-wide chunks
+            for chunk_idx in 0..c_out_chunks {
+                let acc = conv_row_8cols(row_in, w_t_ptr, cols, c_out, chunk_idx * 8);
+                _mm256_storeu_ps(row_out.add(chunk_idx * 8), acc);
+            }
+            // Tail (c_out_tail_start..c_out) — scalar
+            for c_out_idx in c_out_tail_start..c_out {
+                *row_out.add(c_out_idx) = conv_row_tail_t(&im2col, &w_t.data, row, cols, c_out, c_out_idx);
+            }
+        });
+        // Bias add + GELU (exact erf via libm) into the NCHW output, parallel
+        // over (ib, c) chunks of f_out * t_out elements each.  Output shape
+        // is [b, c_out, f_out, t_out] (NCHW), so c_slab is one (ib, c) plane.
+        let bias = self.bias.as_ref().unwrap();
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
         let mut result = vec![0.0f32; b * c_out * f_out * t_out];
-        for ib in 0..b {
-            for c in 0..c_out {
-                for fo in 0..f_out {
-                    for to in 0..t_out {
-                        let row = (ib * f_out + fo) * t_out + to;
-                        let v = out[c * n_rows + row] + self.bias.as_ref().unwrap()[c];
-                        // GELU (exact erf, matching GPU kernel's erff)
-                        result[((ib * c_out + c) * f_out + fo) * t_out + to] =
-                            0.5 * v * (1.0 + libm::erff(v * std::f32::consts::FRAC_1_SQRT_2));
-                    }
+        result.par_chunks_mut(f_out * t_out).enumerate().for_each(|(ic, c_slab)| {
+            let ib = ic / c_out;
+            let c = ic % c_out;
+            let b_val = bias[c];
+            for fo in 0..f_out {
+                for to in 0..t_out {
+                    let row = (ib * f_out + fo) * t_out + to;
+                    let v = matmul_out[row * c_out + c] + b_val;
+                    c_slab[fo * t_out + to] =
+                        0.5 * v * (1.0 + libm::erff(v * inv_sqrt2));
                 }
             }
-        }
+        });
         CpuTensor::new(result, vec![b, c_out, f_out, t_out])
     }
 }
