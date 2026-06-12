@@ -573,6 +573,11 @@ fn prefill_attention(
     let scale = 1.0f32 / (hd as f32).sqrt();
     let out = vec![0.0f32; b * s * nqh * hd];
 
+    // P1-2 (v2): keep the per-head scalar outer loop (32-way parallel), but
+    // SIMD-ize the two hot inner loops with AVX2+FMA: the Q@K dot product
+    // (was the 87% of text_decoder on 180s) and the A@V weighted sum.
+    // The previous attempt to use the gemm crate failed because matrixmultiply
+    // is tuned for K>=256, and our K=128 was too small for the microkernel.
     (0..b * nqh).into_par_iter().for_each(|idx| {
         let ib = idx / nqh;
         let qh = idx % nqh;
@@ -586,6 +591,8 @@ fn prefill_attention(
             q_qh[i * hd..(i + 1) * hd].copy_from_slice(&q.data[src..src + hd]);
         }
 
+        // Q @ K^T: per-head [s, hd] @ [hd, s] -> [s, s].  Causal mask in inner
+        // loop.  Inner dot product is 8-wide FMA.
         let mut scores = vec![0.0f32; s * cur_len];
         for i in 0..s {
             let qi = &q_qh[i * hd..(i + 1) * hd];
@@ -595,12 +602,14 @@ fn prefill_attention(
                     scores[i * cur_len + t] = f32::NEG_INFINITY;
                 } else {
                     let kt = &k_cache[k_base + t * hd..k_base + (t + 1) * hd];
-                    let mut dot = 0.0f32;
-                    for j in 0..hd { dot += qi[j] * kt[j]; }
+                    let dot = unsafe { dot_qk_avx2(qi, kt) };
                     scores[i * cur_len + t] = dot * scale;
                 }
             }
         }
+        // Softmax: scalar (the f32::exp call is the dominant cost and
+        // a polynomial SIMD exp would change bit-exactness; not worth it
+        // for the small ~5% gain on this 5% slice of the decoder).
         for i in 0..s {
             let row = &mut scores[i * cur_len..(i + 1) * cur_len];
             let mut mx = f32::NEG_INFINITY;
@@ -610,6 +619,8 @@ fn prefill_attention(
             let inv = 1.0 / sum;
             for v in row.iter_mut() { *v *= inv; }
         }
+        // Scores @ V: per-head [s, s] @ [s, hd] -> [s, hd].  Weighted sum
+        // (out_i += w * v_t) is 8-wide FMA per (i, t) pair.
         let out_ptr = out.as_ptr() as *mut f32;
         for i in 0..s {
             let dst_off = ((ib * s + i) * nqh + qh) * hd;
@@ -621,13 +632,55 @@ fn prefill_attention(
                     let w = row[t];
                     if w == 0.0 { continue; }
                     let vt = &v_cache[v_base + t * hd..v_base + (t + 1) * hd];
-                    for j in 0..hd { out_i[j] += w * vt[j]; }
+                    axpy_avx2(out_i, w, vt);
                 }
             }
         }
     });
 
     CpuTensor::new(out, vec![b, nqh, s, hd])
+}
+
+/// AVX2+FMA dot product of two f32 slices of equal length.  Caller must
+/// ensure len is a multiple of 8 (the text decoder's hd=128 always is).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_qk_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len() % 8, 0);
+    let mut acc = _mm256_setzero_ps();
+    let n = a.len() / 8;
+    for j in 0..n {
+        let va = _mm256_loadu_ps(a.as_ptr().add(j * 8));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(j * 8));
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+    // Horizontal sum of 8 lanes: hsum = (acc[0]+acc[1]+...+acc[7]).
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    _mm_cvtss_f32(s)
+}
+
+/// AVX2+FMA: out[i] += w * v[i] for i in 0..out.len().  Caller must ensure
+/// len is a multiple of 8.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2(out: &mut [f32], w: f32, v: &[f32]) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(out.len(), v.len());
+    debug_assert_eq!(out.len() % 8, 0);
+    let wv = _mm256_set1_ps(w);
+    let n = out.len() / 8;
+    for j in 0..n {
+        let vo = _mm256_loadu_ps(out.as_ptr().add(j * 8));
+        let vv = _mm256_loadu_ps(v.as_ptr().add(j * 8));
+        let r = _mm256_fmadd_ps(wv, vv, vo);
+        _mm256_storeu_ps(out.as_mut_ptr().add(j * 8), r);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
