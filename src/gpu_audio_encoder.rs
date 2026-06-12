@@ -93,7 +93,7 @@ impl GpuAudioAttention {
     /// x [1, s, dm]; windowed attention over chunks of size `ws`.
     fn forward(&self, cuda: &CudaState, x: &GpuTensor, ws: Option<usize>) -> Result<GpuTensor> {
         let dims = x.shape();
-        let b = dims[0]; let s = dims[1]; let dm = dims[2];
+        let b = dims[0]; let s = dims[1];
         let nh = self.num_heads; let hd = self.head_dim;
 
         // Project Q, K, V.

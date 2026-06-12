@@ -355,27 +355,6 @@ extern "C" __global__ void rms_norm_rotary_f16(
 // ─── Repeat KV from sparse cache ───────────────────────────────────
 // cache layout (per-layer): [b, nkvh, max_seq, d]; valid rows [0..cur_len).
 // Output dst [b, nqh, cur_len, d] contiguous (cur_len-major within head).
-extern "C" __global__ void repeat_kv_from_cache_f16(
-    __half* __restrict__ dst,
-    const __half* __restrict__ cache,
-    int b, int nkvh, int max_seq, int d,
-    int n_rep, int cur_len
-) {
-    int nqh = nkvh * n_rep;
-    int tot = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = b * nqh * cur_len * d;
-    if (tot >= total) return;
-
-    int id = tot % d;
-    int is = (tot / d) % cur_len;
-    int iq = (tot / (d * cur_len)) % nqh;
-    int ib = tot / (d * cur_len * nqh);
-
-    int ikv = iq / n_rep;
-    int src_idx = ((ib * nkvh + ikv) * max_seq + is) * d + id;
-    dst[tot] = cache[src_idx];
-}
-
 // ─── Embedding lookup ─────────────────────────────────────────────
 extern "C" __global__ void embed_lookup_f16(
     __half* __restrict__ out,

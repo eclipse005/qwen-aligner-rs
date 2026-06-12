@@ -93,7 +93,6 @@ pub(crate) struct CudaKernels {
     pub softmax_causal_online: CudaFunction,
     pub rotary_emb: CudaFunction,
     pub rms_norm_rotary: CudaFunction,
-    pub repeat_kv_from_cache: CudaFunction,
     pub embed_lookup: CudaFunction,
     pub embed_lookup_single_i32: CudaFunction,
     pub argmax: CudaFunction,
@@ -163,7 +162,6 @@ impl CudaState {
             softmax_causal_online: module.load_function("softmax_scaled_causal_online_f16")?,
             rotary_emb: module.load_function("rotary_emb_f16")?,
             rms_norm_rotary: module.load_function("rms_norm_rotary_f16")?,
-            repeat_kv_from_cache: module.load_function("repeat_kv_from_cache_f16")?,
             embed_lookup: module.load_function("embed_lookup_f16")?,
             embed_lookup_single_i32: module.load_function("embed_lookup_single_i32_f16")?,
             argmax: module.load_function("argmax_f16")?,
@@ -675,23 +673,6 @@ impl CudaState {
     }
 
     /// Repeat-KV from a sparse KV cache, producing a dense [b, nqh, cur_len, d] view.
-    pub fn repeat_kv_from_cache(&self, cache: &CudaSlice<f16>,
-        b: usize, nkvh: usize, max_seq: usize, d: usize, n_rep: usize, cur_len: usize,
-    ) -> Result<GpuTensor> {
-        let nqh = nkvh * n_rep;
-        let total = b * nqh * cur_len * d;
-        let mut out = self.alloc_uninit_f16(total)?;
-        let cfg = LaunchConfig::for_num_elems(total as u32);
-        let b_i = b as i32; let nkvh_i = nkvh as i32; let max_i = max_seq as i32;
-        let d_i = d as i32; let nrep_i = n_rep as i32; let cur_i = cur_len as i32;
-        let mut bb = self.stream.launch_builder(&self.k.repeat_kv_from_cache);
-        bb.arg(&mut out); bb.arg(cache);
-        bb.arg(&b_i); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i);
-        bb.arg(&nrep_i); bb.arg(&cur_i);
-        unsafe { bb.launch(cfg) }?;
-        Ok(GpuTensor::new(out, vec![b, nqh, cur_len, d]))
-    }
-
     pub fn embed_lookup(&self, table: &GpuWeight, ids_gpu: &CudaSlice<i64>) -> Result<GpuTensor> {
         let n = ids_gpu.len();
         let d = table.cols;
