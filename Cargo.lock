@@ -1753,6 +1753,7 @@ dependencies = [
  "gemm",
  "half",
  "hound",
+ "libm",
  "lindera",
  "log",
  "rayon",
@@ -1760,6 +1761,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokenizers",
 ]
 

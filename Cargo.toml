@@ -33,6 +33,7 @@ cpu = ["dep:gemm", "dep:rayon"]
 cudarc = { version = "0.19.7", features = ["cublas", "f16", "nvrtc", "cuda-12080"], optional = true }
 gemm = { version = "0.18", optional = true }
 rayon = { version = "1", optional = true }
+libm = "0.2"
 half = "2"
 tokenizers = { version = "0.22", features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
@@ -41,6 +42,7 @@ hound = "3"
 rustfft = "6"
 anyhow = "1"
 safetensors = "0.4"
+thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 lindera = { version = "3.0.7", default-features = false, features = ["embed-ipadic"] }
 log = "0.4"

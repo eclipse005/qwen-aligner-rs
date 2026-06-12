@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::TextConfig;
-pub use crate::weight::WeightTensor;
+pub(crate) use crate::raw_tensor::RawTensor;
 
 const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
@@ -1147,35 +1147,33 @@ impl GpuKvCache {
 
 pub(crate) mod gpu_helpers {
     use super::*;
-    pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<GpuWeight> {
+    pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<GpuWeight> {
         super::load_gpu_weight(cuda, weights, name)
     }
-    pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<CudaSlice<f16>> {
+    pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<CudaSlice<f16>> {
         super::load_gpu_vec(cuda, weights, name)
     }
 }
 
-fn get_weight_f16(weights: &HashMap<String, WeightTensor>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
+fn get_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
     let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
-    let shape = td.shape.clone();
-    let data_f16: Vec<f16> = td.data.iter().map(|&v| f16::from_f32(v)).collect();
-    Ok((data_f16, shape))
+    td.as_f16().map_err(|e| anyhow::anyhow!("weight {} dtype error: {}", name, e))
 }
 
-fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<GpuWeight> {
+fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<GpuWeight> {
     let (data_f16, shape) = get_weight_f16(weights, name)?;
     assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
     let dev = cuda.upload_f16(&data_f16)?;
     Ok(GpuWeight { data: dev, rows: shape[0], cols: shape[1] })
 }
 
-fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, WeightTensor>, name: &str) -> Result<CudaSlice<f16>> {
+fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<CudaSlice<f16>> {
     let (data_f16, _shape) = get_weight_f16(weights, name)?;
     cuda.upload_f16(&data_f16)
 }
 
 fn load_fused_qkv_weight(
-    weights: &HashMap<String, WeightTensor>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, RawTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize, usize)> {
     let (qw, qs) = get_weight_f16(weights, &format!("{}.q_proj.weight", prefix))?;
     let (kw, ks) = get_weight_f16(weights, &format!("{}.k_proj.weight", prefix))?;
@@ -1190,7 +1188,7 @@ fn load_fused_qkv_weight(
 }
 
 fn load_fused_gate_up_weight(
-    weights: &HashMap<String, WeightTensor>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, RawTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize)> {
     let (gw, gs) = get_weight_f16(weights, &format!("{}.gate_proj.weight", prefix))?;
     let (uw, us) = get_weight_f16(weights, &format!("{}.up_proj.weight", prefix))?;
@@ -1219,7 +1217,7 @@ struct GpuDecoderLayer {
 }
 
 impl GpuDecoderLayer {
-    fn load(w: &HashMap<String, WeightTensor>, p: &str, cfg: &TextConfig, cuda: &CudaState) -> Result<Self> {
+    fn load(w: &HashMap<String, RawTensor>, p: &str, cfg: &TextConfig, cuda: &CudaState) -> Result<Self> {
         Ok(Self {
             iln_w: load_gpu_vec(cuda, w, &format!("{}.input_layernorm.weight", p))?,
             pln_w: load_gpu_vec(cuda, w, &format!("{}.post_attention_layernorm.weight", p))?,
@@ -1370,7 +1368,7 @@ pub(crate) struct GpuTextDecoder {
 }
 
 impl GpuTextDecoder {
-    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, WeightTensor>, prefix: &str, config: &TextConfig) -> Result<Self> {
+    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextConfig) -> Result<Self> {
         let (embed_f16, embed_shape) = get_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
         let embed_dev = cuda.upload_f16(&embed_f16)?;
         let embed_table = GpuWeight { data: embed_dev, rows: embed_shape[0], cols: embed_shape[1] };
