@@ -189,6 +189,50 @@ pub(crate) fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
     CpuTensor::new(out, shape)
 }
 
+/// LayerNorm (with affine, no residual).  out[i, j] = (x[i, j] - mean) / sqrt(var + eps) * w[j] + b[j].
+pub(crate) fn layer_norm(x: &CpuTensor, w: &[f32], b: &[f32], eps: f32) -> CpuTensor {
+    let nd = x.shape.len();
+    let last = x.shape[nd - 1];
+    let outer: usize = x.shape[..nd - 1].iter().product();
+    assert_eq!(w.len(), last);
+    assert_eq!(b.len(), last);
+    let mut out = vec![0.0f32; outer * last];
+    out.par_chunks_mut(last)
+        .zip(x.data.par_chunks(last))
+        .for_each(|(o, xrow)| {
+            let mut mean = 0.0f64;
+            for &v in xrow { mean += v as f64; }
+            mean /= last as f64;
+            let mut var = 0.0f64;
+            for &v in xrow { let d = v as f64 - mean; var += d * d; }
+            var /= last as f64;
+            let inv_std = 1.0 / (var + eps as f64).sqrt() as f32;
+            for j in 0..last {
+                let v = xrow[j] as f64;
+                o[j] = (((v - mean) * inv_std as f64) as f32) * w[j] + b[j];
+            }
+        });
+    CpuTensor::new(out, x.shape.clone())
+}
+
+/// out[i] = a[i] + b[i], broadcasts over matching shapes.
+pub(crate) fn add(a: &CpuTensor, b: &CpuTensor) -> CpuTensor {
+    assert_eq!(a.shape, b.shape);
+    let mut out = vec![0.0f32; a.numel()];
+    out.par_iter_mut()
+        .zip(a.data.par_iter().zip(b.data.par_iter()))
+        .for_each(|(o, (x, y))| *o = x + y);
+    CpuTensor::new(out, a.shape.clone())
+}
+
+/// a += b, in place.
+pub(crate) fn add_inplace(a: &mut CpuTensor, b: &CpuTensor) {
+    assert_eq!(a.shape, b.shape);
+    a.data.par_iter_mut()
+        .zip(b.data.par_iter())
+        .for_each(|(x, y)| *x += *y);
+}
+
 pub(crate) fn embed_lookup(table: &CpuWeight, ids: &[i64]) -> CpuTensor {
     let n = ids.len();
     let d = table.cols;
@@ -218,6 +262,102 @@ pub(crate) fn argmax(x: &[f32]) -> i32 {
         })
         .reduce(|| (0usize, f32::NEG_INFINITY), |a, b| if b.1 > a.1 { b } else { a });
     idx as i32
+}
+
+/// Swap dims 1 and 2 of a 4D tensor: [d0, d1, d2, d3] → [d0, d2, d1, d3].
+pub(crate) fn swap_dims_12(x: &CpuTensor) -> CpuTensor {
+    assert_eq!(x.shape.len(), 4);
+    let (d0, d1, d2, d3) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+    let src = x.data.clone();
+    let mut out = vec![0.0f32; d0 * d2 * d1 * d3];
+    // Parallelise over (i0, i2): each job writes a d1*d3 slab into `out`.
+    // Within the slab, the inner i1 loop writes d3 bytes per iter at the
+    // correct offset (i1 * d3) — NOT into the whole slab at once (which
+    // would mismatch sizes).
+    out.par_chunks_mut(d1 * d3).enumerate().for_each(|(idx, slab)| {
+        let i0 = idx / d2;
+        let i2 = idx % d2;
+        for i1 in 0..d1 {
+            let src_off = ((i0 * d1 + i1) * d2 + i2) * d3;
+            let dst_in_slab = i1 * d3;
+            slab[dst_in_slab..dst_in_slab + d3]
+                .copy_from_slice(&src[src_off..src_off + d3]);
+        }
+    });
+    CpuTensor::new(out, vec![d0, d2, d1, d3])
+}
+
+/// Q @ K^T for [b, nh, s, hd] layout, returns [b, nh, s, s].
+/// Per (b, nh), one gemm call (m=s, n=s, k=hd).
+pub(crate) fn matmul_qk(q: &CpuTensor, k: &CpuTensor) -> CpuTensor {
+    let qs = q.shape();
+    let (b, nh, s, hd) = (qs[0], qs[1], qs[2], qs[3]);
+    let mut out = vec![0.0f32; b * nh * s * s];
+    out.par_chunks_mut(s * s).enumerate().for_each(|(idx, slab)| {
+        let ib = idx / nh;
+        let ih = idx % nh;
+        let q_off = (ib * nh + ih) * s * hd;
+        let k_off = (ib * nh + ih) * s * hd;
+        // gemm: m=s, n=s, k=hd.  Output is row-major [s, s]: out[i, j] = sum_k q[i, k] * k[j, k].
+        // cs for j+1 is 1, rs for i+1 is s.  For k (b^T, i.e. transposed), element (i, j) = k[j, i]?
+        // — no, gemm computes A @ B (no transpose).  We want Q @ K^T, so B is conceptually
+        // [hd, s] with element (i, j) = K[j, i].  Since K is row-major [s, hd] with
+        // element (i, k) at i*hd + k, the B^T of that is [hd, s] with element (k, j) = K[j, k].
+        // We pass rhs as a [hd, s] view: rhs_cs=1, rhs_rs=hd is wrong for that; actually
+        // for rhs as [hd, s] row-major, element (i, j) = i*s + j: i+1 advances s, j+1 advances 1.
+        // K (row-major [s, hd]) data layout is identical to K^T ([hd, s] col-major) only if we
+        // swap cs and rs.  Concretely: pass rhs as the K data pointer with cs=hd, rs=1, which
+        // is what a transposed matrix view looks like in BLAS.
+        unsafe {
+            gemm(
+                s, s, hd,
+                slab.as_mut_ptr(),
+                1, s as isize,
+                false,
+                q.data.as_ptr().add(q_off),
+                1, hd as isize,
+                k.data.as_ptr().add(k_off),
+                hd as isize, 1,
+                0.0, 1.0,
+                false, false, false,
+                Parallelism::None,
+            );
+        }
+    });
+    CpuTensor::new(out, vec![b, nh, s, s])
+}
+
+/// Attention @ V: [b, nh, s, t] × [b, nh, t, hd] → [b, nh, s, hd] (bytes laid out
+/// [b, s, nh, hd] so the caller can reshape directly to [b, s, nqh*hd]).
+pub(crate) fn matmul_av(attn: &CpuTensor, v: &CpuTensor) -> CpuTensor {
+    let vs = v.shape();
+    let (b, nh, t, hd) = (vs[0], vs[1], vs[2], vs[3]);
+    let s = attn.shape()[2];
+    let mut out = vec![0.0f32; b * s * nh * hd];
+    out.par_chunks_mut(s * hd).enumerate().for_each(|(bn, slab)| {
+        let ib = bn / nh;
+        let ih = bn % nh;
+        let a_off = (ib * nh + ih) * s * t;
+        let v_off = (ib * nh + ih) * t * hd;
+        // m=s, n=hd, k=t.  Output is row-major [s, hd] with strides (1, hd).
+        // V is row-major [t, hd] with strides (1, hd), so pass as-is.
+        unsafe {
+            gemm(
+                s, hd, t,
+                slab.as_mut_ptr(),
+                1, hd as isize,
+                false,
+                attn.data.as_ptr().add(a_off),
+                1, t as isize,
+                v.data.as_ptr().add(v_off),
+                1, hd as isize,
+                0.0, 1.0,
+                false, false, false,
+                Parallelism::None,
+            );
+        }
+    });
+    CpuTensor::new(out, vec![b, nh, s, hd])
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -373,25 +513,502 @@ fn prefill_attention(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Audio encoder — stub
+//  Audio encoder — full CPU port mirroring gpu_audio_encoder.rs
 // ═══════════════════════════════════════════════════════════════════════
+//
+// Architecture:
+//   conv2d stem (3 × 3x3 s=2 p=1 + GELU) → conv_out (Linear) + sinusoidal PE
+//   → 24 × { LayerNorm + Self-attention (full) + LayerNorm + FFN (GELU) }
+//   → ln_post + proj1 (GELU) + proj2
+//
+// f16 input (mel spectrogram chunks) → f32 internal (faster on modern x86) → f16 output.
+// Same `run(mel_packed, b_chunks, n_mels, cs, chunk_tokens) → (Vec<f16>, out_dim)` signature
+// as the GPU encoder, so the dispatch in `inference::align_waveform_text_cpu` can
+// mirror the CUDA path's data flow.
 
-/// The audio encoder is not yet implemented on CPU.  The conv stem
-/// (3 × stride-2 conv2d) plus 24 transformer layers is ~2x more work than
-/// the 28-layer text decoder, and the per-chunk conv_out reshape that the
-/// CUDA path does dynamically is fiddly to port.  See handoff.md for the
-/// plan; in the meantime `DeviceRequest::Cpu` fails fast here.
-pub(crate) struct CpuAudioEncoder;
+// ─── Conv stem ──────────────────────────────────────────────────────
+
+struct CpuConv2d {
+    weight: CpuWeight,   // [c_out, c_in, kh, kw]
+    bias: Option<Vec<f32>>,
+    in_channels: usize,
+    out_channels: usize,
+}
+
+impl CpuConv2d {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str) -> Result<Self> {
+        let (w, ws) = load_f32(weights, &format!("{prefix}.weight"))?;
+        assert_eq!(ws.len(), 4, "conv weight {prefix}.weight should be 4D [c_out, c_in, kh, kw]");
+        let c_out = ws[0];
+        let c_in = ws[1];
+        let kh = ws[2]; let kw = ws[3];
+        assert_eq!(kh, 3, "expected 3x3 conv, got kh={}", kh);
+        assert_eq!(kw, 3, "expected 3x3 conv, got kw={}", kw);
+        let bias = if weights.contains_key(&format!("{prefix}.bias")) {
+            Some(load_vec(weights, &format!("{prefix}.bias"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            weight: CpuWeight { data: w, rows: c_out, cols: c_in * 9 },
+            bias,
+            in_channels: c_in,
+            out_channels: c_out,
+        })
+    }
+
+    /// x: [b, c_in, f, t] NCHW  →  out: [b, c_out, f_out, t_out]
+    /// stride=2, padding=1, kernel=3, with GELU.
+    fn forward_gelu(&self, x: &CpuTensor) -> CpuTensor {
+        let s = x.shape();
+        let b = s[0];
+        let c_in = s[1];
+        let f = s[2];
+        let t = s[3];
+        let c_out = self.out_channels;
+        // Conv2d with stride=2, pad=1, kernel=3 (PyTorch convention):
+        //   out_len = floor((in_len + 2*1 - 3) / 2) + 1 = floor((in_len - 1) / 2) + 1
+        let f_out = (f - 1) / 2 + 1;
+        let t_out = (t - 1) / 2 + 1;
+        // Im2col: for each (b, f_out, t_out), gather a 3x3 patch of all c_in channels
+        // → row of length c_in*9.  Total rows = b * f_out * t_out.
+        // gemm: y[c_out, c_in*9] @ X[c_in*9, b*f_out*t_out] = out[c_out, b*f_out*t_out]
+        // then add bias, GELU, reshape to [b, c_out, f_out, t_out].
+        let cols_per_row = c_in * 9;
+        let n_rows = b * f_out * t_out;
+        let mut im2col = vec![0.0f32; n_rows * cols_per_row];
+        for ib in 0..b {
+            for ifo in 0..f_out {
+                let f0 = ifo * 2;       // top-left of the receptive window in input
+                for ito in 0..t_out {
+                    let t0 = ito * 2;
+                    let row = (ib * f_out + ifo) * t_out + ito;
+                    let mut col = 0;
+                    for c in 0..c_in {
+                        for kh in 0..3 {
+                            for kw in 0..3 {
+                                let f_in = f0 + kh - 1;   // pad=1
+                                let t_in = t0 + kw - 1;
+                                let v = if f_in < f && t_in < t {
+                                    x.data[((ib * c_in + c) * f + f_in) * t + t_in]
+                                } else {
+                                    0.0
+                                };
+                                im2col[row * cols_per_row + col] = v;
+                                col += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // gemm: W is [c_out, c_in*9] (row-major).  Compute y = W @ X → [c_out, n_rows].
+        // Use gemm crate with non-parallel (im2col is already parallelised via outer loop,
+        // and the matmul dims are small enough that single-threaded gemm is fine here).
+        // gemm API: gemm(m, n, k, c_ptr, c_cs, c_rs, transpose_c, a_ptr, a_cs, a_rs,
+        //                              b_ptr, b_cs, b_rs, beta, alpha, ...).
+        // For row-major [m, k] matrix, cs (column stride) = 1, rs (row stride) = k.
+        let mut out = vec![0.0f32; c_out * n_rows];
+        unsafe {
+            gemm(
+                c_out, n_rows, cols_per_row,
+                out.as_mut_ptr(),
+                1, n_rows as isize,            // dst [c_out, n_rows]: cs=1, rs=n_rows
+                false,
+                self.weight.data.as_ptr(),
+                1, cols_per_row as isize,      // lhs [c_out, c_in*9]: cs=1, rs=c_in*9
+                im2col.as_ptr(),
+                1, n_rows as isize,            // rhs [c_in*9, n_rows]: cs=1, rs=n_rows
+                0.0, 1.0,
+                false, false, false,
+                Parallelism::None,
+            );
+        }
+        // Add bias and GELU(tanh approx).  After gemm, out[i, j] = sum_k W[i,k] * X[k,j].
+        // Layout is [c_out, n_rows], so out[(i * n_rows) + j] is the (i, j) element.
+        // We want to reshape to [b, c_out, f_out, t_out], so dst[ib, c, fo, to] = out[c, row]
+        // where row = (ib * f_out + fo) * t_out + to.
+        let mut result = vec![0.0f32; b * c_out * f_out * t_out];
+        for ib in 0..b {
+            for c in 0..c_out {
+                for fo in 0..f_out {
+                    for to in 0..t_out {
+                        let row = (ib * f_out + fo) * t_out + to;
+                        let v = out[c * n_rows + row] + self.bias.as_ref().unwrap()[c];
+                        // GELU(tanh approx): 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x^3)))
+                        let inner = 0.7978845608028654f32 * (v + 0.044715 * v * v * v);
+                        result[((ib * c_out + c) * f_out + fo) * t_out + to] =
+                            0.5 * v * (1.0 + inner.tanh());
+                    }
+                }
+            }
+        }
+        CpuTensor::new(result, vec![b, c_out, f_out, t_out])
+    }
+}
+
+struct CpuLinear {
+    weight: CpuWeight,   // [out, in]
+    bias: Option<Vec<f32>>,
+}
+
+impl CpuLinear {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str) -> Result<Self> {
+        let (w, ws) = load_f32(weights, &format!("{prefix}.weight"))?;
+        assert_eq!(ws.len(), 2, "linear {prefix}.weight should be 2D");
+        let bias = if weights.contains_key(&format!("{prefix}.bias")) {
+            Some(load_vec(weights, &format!("{prefix}.bias"))?)
+        } else {
+            None
+        };
+        Ok(Self { weight: CpuWeight { data: w, rows: ws[0], cols: ws[1] }, bias })
+    }
+
+    /// x: [..., in_dim]  →  out: [..., out_dim]
+    fn forward(&self, x: &CpuTensor) -> CpuTensor {
+        let mut y = linear(x, &self.weight);
+        // Bias add — broadcast bias over all leading dims.  Some linears
+        // (e.g. conv_out in the audio tower) have no bias.
+        if let Some(bias) = &self.bias {
+            let nd = x.shape.len();
+            let outer: usize = x.shape[..nd - 1].iter().product();
+            let out_dim = y.shape[nd - 1];
+            for i in 0..outer {
+                for j in 0..out_dim {
+                    y.data[i * out_dim + j] += bias[j];
+                }
+            }
+        }
+        y
+    }
+}
+
+struct CpuLayerNorm {
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+    eps: f32,
+}
+
+impl CpuLayerNorm {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str, eps: f32) -> Result<Self> {
+        Ok(Self {
+            weight: load_vec(weights, &format!("{prefix}.weight"))?,
+            bias: load_vec(weights, &format!("{prefix}.bias"))?,
+            eps,
+        })
+    }
+    fn forward(&self, x: &CpuTensor) -> CpuTensor {
+        layer_norm(x, &self.weight, &self.bias, self.eps)
+    }
+}
+
+struct CpuConvStem {
+    conv1: CpuConv2d,
+    conv2: CpuConv2d,
+    conv3: CpuConv2d,
+    conv_out: CpuLinear,
+    pe: Vec<f32>,    // [max_pos, d_model]
+    d_model: usize,
+    max_pos: usize,
+    n_mels_out: usize,
+    c3_out: usize,
+}
+
+impl CpuConvStem {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str, config: &AudioConfig) -> Result<Self> {
+        let conv1 = CpuConv2d::load(weights, &format!("{prefix}.conv2d1"))?;
+        let conv2 = CpuConv2d::load(weights, &format!("{prefix}.conv2d2"))?;
+        let conv3 = CpuConv2d::load(weights, &format!("{prefix}.conv2d3"))?;
+        let conv_out = CpuLinear::load(weights, &format!("{prefix}.conv_out"))?;
+        let dm = config.d_model;
+        let max_pos = config.max_source_positions;
+        // Conv stem downsamples 3x by stride=2 → n_mels_out = f(f(f(n_mels)))
+        let f = |l: usize| -> usize { l / 2 };
+        let n_mels_out = f(f(f(config.num_mel_bins)));
+        let c3_out = conv3.out_channels;
+        // Sinusoidal PE (matches asr-burn's CPU encoder, identical math to the CUDA path).
+        let half = dm / 2;
+        let lt = (10000.0f64).ln() / (half as f64 - 1.0).max(1.0);
+        let mut pe_f32 = vec![0.0f32; max_pos * dm];
+        for p in 0..max_pos {
+            for i in 0..half {
+                let a = p as f64 * (-(i as f64) * lt).exp();
+                pe_f32[p * dm + i] = a.sin() as f32;
+                pe_f32[p * dm + half + i] = a.cos() as f32;
+            }
+        }
+        Ok(Self {
+            conv1, conv2, conv3, conv_out, pe: pe_f32,
+            d_model: dm, max_pos, n_mels_out, c3_out,
+        })
+    }
+
+    /// Run conv stem on chunked mel input [b_chunks, 1, n_mels, cs].
+    /// Returns (output, t2) where output is [b_chunks, t2, d_model] (with PE added).
+    fn forward(&self, mel_chunks: &[f16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(CpuTensor, usize)> {
+        // mel_packed: [b_chunks, 1, n_mels, cs] in NCHW.  Convert to f32.
+        let x_data: Vec<f32> = mel_chunks.iter().map(|v| v.to_f32()).collect();
+        let x = CpuTensor::new(x_data, vec![b_chunks, 1, n_mels, cs]);
+
+        let x = self.conv1.forward_gelu(&x);
+        let x = self.conv2.forward_gelu(&x);
+        let x = self.conv3.forward_gelu(&x);
+        // x: [b_chunks, c3_out, f2, t2].  Permute → [b_chunks, t2, c3_out*f2] for the linear.
+        let xs = x.shape();
+        let (b, c, fo, t2) = (xs[0], xs[1], xs[2], xs[3]);
+        assert_eq!(fo, self.n_mels_out, "conv stem spatial out mismatch: got {}, expected {}", fo, self.n_mels_out);
+        // Pack [b, t2, c*f2] in row-major.
+        let mut perm = vec![0.0f32; b * t2 * c * fo];
+        for ib in 0..b {
+            for it in 0..t2 {
+                for ic in 0..c {
+                    for f in 0..fo {
+                        // src is [b, c, f, t] = ((ib * c + ic) * f + f) * t2 + it
+                        let src = ((ib * c + ic) * fo + f) * t2 + it;
+                        let dst = ((ib * t2 + it) * c + ic) * fo + f;
+                        perm[dst] = x.data[src];
+                    }
+                }
+            }
+        }
+        // conv_out linear: W is [d_model, c*f2].  out = perm @ W^T.
+        // The conv_out weight's second dim is c3 * n_mels_out (per the standard fixed
+        // size), so we can build a CpuWeight once and reuse.
+        let in_dim = c * fo;
+        // Per-chunk we need a [t2, in_dim] @ [in_dim, d_model] matmul.  Reshape
+        // perm as [b*t2, in_dim] and use our linear() which is GEMV-fast for m=1.
+        // Actually [b*t2, in_dim] is multi-row, so it's the gemm path.  Group the
+        // chunks together for one big gemm.
+        let perm_2d = CpuTensor::new(perm, vec![b * t2, in_dim]);
+        // Conv_out weight: in load() we have [d_model, c*f2].  For each chunk the
+        // *actual* in_dim is c * fo (== c * n_mels_out).  This is constant across
+        // chunks because the conv stem always produces the same f_out = n_mels_out
+        // for both full and tail chunks (the t-dim shrinks, not the f-dim).
+        // So the same weight applies for every chunk.  Good — we built it once in load.
+        let co = self.conv_out.forward(&perm_2d);
+        // co: [b*t2, d_model].  Add PE row it (broadcast over b).
+        let mut out = co.data.clone();
+        for ib in 0..b {
+            for it in 0..t2 {
+                let base = (ib * t2 + it) * self.d_model;
+                let pe_base = it * self.d_model;
+                for j in 0..self.d_model {
+                    out[base + j] += self.pe[pe_base + j];
+                }
+            }
+        }
+        Ok((CpuTensor::new(out, vec![b, t2, self.d_model]), t2))
+    }
+}
+
+// ─── Audio attention (full — aligner doesn't use windowed) ─────────
+
+struct CpuAudioAttention {
+    q_proj: CpuLinear,
+    k_proj: CpuLinear,
+    v_proj: CpuLinear,
+    out_proj: CpuLinear,
+    num_heads: usize,
+    head_dim: usize,
+}
+
+impl CpuAudioAttention {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str, num_heads: usize, d_model: usize) -> Result<Self> {
+        Ok(Self {
+            q_proj: CpuLinear::load(weights, &format!("{prefix}.q_proj"))?,
+            k_proj: CpuLinear::load(weights, &format!("{prefix}.k_proj"))?,
+            v_proj: CpuLinear::load(weights, &format!("{prefix}.v_proj"))?,
+            out_proj: CpuLinear::load(weights, &format!("{prefix}.out_proj"))?,
+            num_heads,
+            head_dim: d_model / num_heads,
+        })
+    }
+
+    /// x: [1, s, d_model]; full causal self-attention (aligner).
+    /// Returns [1, s, d_model].
+    fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
+        let s = x.shape[1];
+        let dm = x.shape[2];
+        let nh = self.num_heads;
+        let hd = self.head_dim;
+
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        // Reshape [1, s, dm] → [1, s, nh, hd] and transpose to [1, nh, s, hd].
+        let q = swap_dims_12(&q.reshape(vec![1, s, nh, hd]));
+        let k = swap_dims_12(&k.reshape(vec![1, s, nh, hd]));
+        let v = swap_dims_12(&v.reshape(vec![1, s, nh, hd]));
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let scores = matmul_qk(&q, &k);  // [1, nh, s, s]
+        let attn = softmax_causal_full(&scores, scale);  // [1, nh, s, s]
+        let attn_out = matmul_av(&attn, &v);  // [1, nh, s, hd] (bytes [1, s, nh, hd])
+        let attn_flat = attn_out.reshape(vec![1, s, dm]);
+        Ok(self.out_proj.forward(&attn_flat))
+    }
+}
+
+/// Causal softmax over the last two dims of a 4D [b, nh, s, t] tensor.
+/// t (= n) is the sequence length; row i masks out columns > i.
+/// out [i, j] = exp(in[i, j]*scale - max) / sum;   0 for j > i.
+fn softmax_causal_full(scores: &CpuTensor, scale: f32) -> CpuTensor {
+    let s = scores.shape();
+    let (b, nh, sl, t) = (s[0], s[1], s[2], s[3]);
+    let mut out = vec![0.0f32; b * nh * sl * t];
+    out.par_chunks_mut(t).enumerate().for_each(|(idx, slab)| {
+        let i = idx % sl;
+        let valid_t = i + 1;   // causal: see columns [0, i]
+        let row = &scores.data[idx * t..(idx + 1) * t];
+        let mut max_v = f32::NEG_INFINITY;
+        for j in 0..valid_t {
+            let v = row[j] * scale;
+            if v > max_v { max_v = v; }
+        }
+        let mut sum = 0.0f32;
+        for j in 0..t {
+            let v = if j < valid_t {
+                ((row[j] * scale) - max_v).exp()
+            } else { 0.0 };
+            slab[j] = v;
+            sum += v;
+        }
+        let inv = 1.0 / sum;
+        for j in 0..t { slab[j] *= inv; }
+    });
+    CpuTensor::new(out, vec![b, nh, sl, t])
+}
+
+// ─── Audio FFN (GELU) ──────────────────────────────────────────────
+
+struct CpuAudioFfn {
+    fc1: CpuLinear,
+    fc2: CpuLinear,
+}
+
+impl CpuAudioFfn {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            fc1: CpuLinear::load(weights, &format!("{prefix}.fc1"))?,
+            fc2: CpuLinear::load(weights, &format!("{prefix}.fc2"))?,
+        })
+    }
+    fn forward(&self, x: &CpuTensor) -> CpuTensor {
+        let mut h = self.fc1.forward(x);
+        // In-place GELU(tanh approx).
+        let n = h.numel();
+        h.data.par_iter_mut().for_each(|v| {
+            let x = *v;
+            let inner = 0.7978845608028654f32 * (x + 0.044715 * x * x * x);
+            *v = 0.5 * x * (1.0 + inner.tanh());
+        });
+        let _ = n;
+        self.fc2.forward(&h)
+    }
+}
+
+// ─── Audio layer ──────────────────────────────────────────────────
+
+struct CpuAudioLayer {
+    sln: CpuLayerNorm,
+    attn: CpuAudioAttention,
+    fln: CpuLayerNorm,
+    ffn: CpuAudioFfn,
+}
+
+impl CpuAudioLayer {
+    fn load(weights: &HashMap<String, WeightTensor>, prefix: &str, num_heads: usize, d_model: usize) -> Result<Self> {
+        Ok(Self {
+            sln: CpuLayerNorm::load(weights, &format!("{prefix}.self_attn_layer_norm"), 1e-5)?,
+            attn: CpuAudioAttention::load(weights, &format!("{prefix}.self_attn"), num_heads, d_model)?,
+            fln: CpuLayerNorm::load(weights, &format!("{prefix}.final_layer_norm"), 1e-5)?,
+            ffn: CpuAudioFfn::load(weights, &format!("{prefix}"))?,
+        })
+    }
+    fn forward(&self, x: CpuTensor) -> Result<CpuTensor> {
+        // x: [1, s, d_model]
+        // Block 1: LN → attn → residual
+        let normed = self.sln.forward(&x);
+        let attn_out = self.attn.forward(&normed)?;
+        let mut h = add(&x, &attn_out);
+        // Block 2: LN → FFN → residual
+        let normed2 = self.fln.forward(&h);
+        let ffn_out = self.ffn.forward(&normed2);
+        add_inplace(&mut h, &ffn_out);
+        Ok(h)
+    }
+}
+
+pub(crate) struct CpuAudioEncoder {
+    conv_stem: CpuConvStem,
+    layers: Vec<CpuAudioLayer>,
+    ln_post: CpuLayerNorm,
+    proj1: CpuLinear,
+    proj2: CpuLinear,
+    d_model: usize,
+    output_dim: usize,
+}
 
 impl CpuAudioEncoder {
-    pub fn load(_weights: &HashMap<String, WeightTensor>, _prefix: &str, _config: &AudioConfig) -> Result<Self> {
-        Ok(Self)
+    pub fn load(weights: &HashMap<String, WeightTensor>, prefix: &str, config: &AudioConfig) -> Result<Self> {
+        let dm = config.d_model;
+        let nh = config.encoder_attention_heads;
+        let mut layers = Vec::with_capacity(config.encoder_layers);
+        for i in 0..config.encoder_layers {
+            layers.push(CpuAudioLayer::load(weights, &format!("{prefix}.layers.{}", i), nh, dm)?);
+        }
+        let ln_post = CpuLayerNorm::load(weights, &format!("{prefix}.ln_post"), 1e-5)?;
+        let proj1 = CpuLinear::load(weights, &format!("{prefix}.proj1"))?;
+        let proj2 = CpuLinear::load(weights, &format!("{prefix}.proj2"))?;
+        let conv_stem = CpuConvStem::load(weights, prefix, config)?;
+        let output_dim = config.output_dim;
+        Ok(Self { conv_stem, layers, ln_post, proj1, proj2, d_model: dm, output_dim })
     }
-    pub fn run(&self, _mel_packed: &[f16], _b_chunks: usize, _n_mels: usize, _cs: usize) -> Result<(Vec<f16>, usize)> {
-        anyhow::bail!(
-            "CPU audio encoder is not yet implemented.  Use DeviceRequest::Cuda(n) \
-             for now.  See handoff.md for the planned port (conv stem + 24 layers)."
-        )
+
+    /// Run the full audio encoder on chunked mel input.  Same signature as
+    /// `GpuAudioEncoder::run` so the dispatch in `inference::align_waveform_text_cpu`
+    /// can mirror the CUDA path's data flow exactly.
+    /// `mel_packed`: flat f16 [b_chunks * 1 * n_mels * cs], NCHW.
+    /// `chunk_tokens[i]`: how many valid tokens chunk i contributes (≤ t2).
+    /// Returns: (f16 [n_total, d_model_proj], output_dim) where d_model_proj is
+    /// the final projection's output dimension.
+    pub fn run(&self, mel_packed: &[f16], b_chunks: usize, n_mels: usize, cs: usize,
+               chunk_tokens: &[usize]) -> Result<(Vec<f16>, usize)> {
+        // 1. Conv stem → [b_chunks, t2, d_model] with PE
+        let (stem_out, t2) = self.conv_stem.forward(mel_packed, b_chunks, n_mels, cs)?;
+        let n_total: usize = chunk_tokens.iter().sum();
+
+        // 2. Pack valid tokens across chunks into a single [1, n_total, d_model] tensor.
+        // Each chunk's first `chunk_tokens[i]` rows of its t2-row block are valid; the rest
+        // are discarded (the tail chunk can have v < t2 since the input window was
+        // smaller than cs).
+        let mut packed = Vec::with_capacity(n_total * self.d_model);
+        for (idx, &v) in chunk_tokens.iter().enumerate() {
+            let base = idx * t2 * self.d_model;
+            packed.extend_from_slice(&stem_out.data[base..base + v * self.d_model]);
+        }
+        let mut h = CpuTensor::new(packed, vec![1, n_total, self.d_model]);
+
+        // 3. 24 × transformer layers (aligner: full attention, no windowing)
+        for layer in &self.layers {
+            h = layer.forward(h)?;
+        }
+
+        // 4. ln_post → proj1 (GELU) → proj2
+        let h = self.ln_post.forward(&h);
+        let mut h = self.proj1.forward(&h);
+        // In-place GELU
+        h.data.par_iter_mut().for_each(|v| {
+            let x = *v;
+            let inner = 0.7978845608028654f32 * (x + 0.044715 * x * x * x);
+            *v = 0.5 * x * (1.0 + inner.tanh());
+        });
+        let h = self.proj2.forward(&h);
+
+        // Cast f32 → f16 for the output.
+        let out: Vec<f16> = h.data.iter().map(|&v| f16::from_f32(v)).collect();
+        Ok((out, self.output_dim))
     }
 }
 
@@ -523,6 +1140,11 @@ impl CpuTextDecoder {
             layers.push(CpuDecoderLayer::load(weights, &format!("{}.layers.{}", prefix, i), config)?);
         }
         Ok(Self { embed_table, lm_head, layers, norm_w, eps: config.rms_norm_eps as f32 })
+    }
+
+    /// Embed ids into [n, hidden] CpuTensor (f32).
+    pub fn embed_ids(&self, ids: &[i64]) -> CpuTensor {
+        embed_lookup(&self.embed_table, ids)
     }
 
     /// Forward pass.

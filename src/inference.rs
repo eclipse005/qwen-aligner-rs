@@ -32,6 +32,8 @@ use crate::cudarc_engine::{
 };
 #[cfg(feature = "cuda")]
 use crate::gpu_audio_encoder::GpuAudioEncoder;
+#[cfg(feature = "cpu")]
+use crate::cpu_engine::{CpuKvCache, CpuTensor};
 use crate::mel::extract_log_mel_features;
 
 const F16_TIMESTAMP_ARGMAX_TIE_EPS: f32 = 1.0 / 256.0;
@@ -173,12 +175,7 @@ struct CudaBackend {
 
 #[cfg(feature = "cpu")]
 struct CpuBackend {
-    // Held for construction-side validation; align() currently bails before
-    // touching either because the audio encoder is still a stub.  Once that
-    // lands, the text_decoder field will be read in align_waveform_text_cpu.
-    #[allow(dead_code)]
     text_decoder: crate::cpu_engine::CpuTextDecoder,
-    #[allow(dead_code)]
     audio_encoder: crate::cpu_engine::CpuAudioEncoder,
 }
 
@@ -385,19 +382,134 @@ impl Qwen3ForcedAligner {
     fn align_waveform_text_cpu(
         &self,
         b: &CpuBackend,
-        _waveform: &[f32],
-        _text: &str,
-        _language: &str,
+        waveform: &[f32],
+        text: &str,
+        language: &str,
     ) -> anyhow::Result<ForcedAlignResult> {
-        // The CPU text decoder is fully implemented but the audio encoder
-        // is not (see handoff.md).  Calling `align()` with `DeviceRequest::Cpu`
-        // reaches this path and fails fast with a clear message rather than
-        // panicking on unimplemented! deep in the audio pipeline.
-        let _ = b;
-        anyhow::bail!(
-            "CPU audio encoder is not yet implemented.  Use DeviceRequest::Cuda(n) \
-             for now.  See handoff.md for the planned port (conv stem + 24 layers)."
-        )
+        let mut profile = Profile::new();
+        let cpu_td = &b.text_decoder;
+        let cpu_ae = &b.audio_encoder;
+
+        // 1. Text tokenization (CPU)
+        let (words, aligner_input) = crate::text::encode_timestamp(text, language)?;
+        // 2. Mel feature extraction (CPU)
+        let features = extract_log_mel_features(waveform)?;
+        profile.mark("prepare_input");
+
+        // 3. Audio pad expansion (CPU)
+        let audio_pad_count = crate::prompt::feature_extract_output_len(features.frames as i64);
+        let expanded_input = crate::prompt::expand_audio_pad_once(&aligner_input, audio_pad_count as usize)?;
+        // 4. Tokenize (CPU)
+        let input_ids_u32 = crate::tokenizer::encode_to_ids(&self.tokenizer, &expanded_input)?;
+        let input_ids: Vec<i64> = input_ids_u32.into_iter().map(i64::from).collect();
+        // 5. Find timestamp positions
+        let timestamp_token_id = self.config.timestamp_token_id as i64;
+        let timestamp_positions: Vec<usize> = input_ids.iter().enumerate()
+            .filter_map(|(i, &id)| if id == timestamp_token_id { Some(i) } else { None })
+            .collect();
+        profile.mark("tokenize");
+
+        // 6. Audio encoder (CPU) ─────────────────────────────
+        let audio_cfg = &self.config.thinker_config.audio_config;
+        let n_window = audio_cfg.n_window;
+        let cs = n_window * 2;
+        let n_mels = audio_cfg.num_mel_bins;
+        let nf = features.frames;
+        let nfull = nf / cs;
+        let tail = nf % cs;
+        let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
+        let tpc = conv_stem_output_len(cs);
+        let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
+        for _ in 0..nfull { chunk_tokens.push(tpc); }
+        if tail > 0 { chunk_tokens.push(conv_stem_output_len(tail)); }
+
+        // Pack mel into CPU conv-stem layout (f16) — identical layout to the CUDA path.
+        let mut mel_packed: Vec<f16> = vec![f16::ZERO; n_chunks * n_mels * cs];
+        for chunk in 0..n_chunks {
+            let start = chunk * cs;
+            let len = cs.min(nf.saturating_sub(start));
+            for mel in 0..n_mels {
+                for t in 0..len {
+                    let src = mel * nf + start + t;
+                    let dst = (chunk * n_mels + mel) * cs + t;
+                    mel_packed[dst] = f16::from_f32(features.values[src]);
+                }
+            }
+        }
+        let (audio_embeds_data, _out_dim) = cpu_ae.run(&mel_packed, n_chunks, n_mels, cs, &chunk_tokens)
+            .context("CPU audio encoder")?;
+        let n_audio_tokens: usize = chunk_tokens.iter().sum();
+        profile.mark("audio_encoder");
+
+        if n_audio_tokens != audio_pad_count as usize {
+            anyhow::bail!("audio feature/token count mismatch: features={} placeholders={}",
+                n_audio_tokens, audio_pad_count);
+        }
+
+        // 7. Embedding merge (CPU-side) ─────────────────────
+        // a) embed_lookup for text tokens (CPU).
+        // b) scatter audio_embeds into the audio_token positions of the same buffer.
+        let audio_token_id = self.config.thinker_config.audio_token_id;
+        let hidden_size = self.config.thinker_config.text_config.hidden_size;
+        let seq_len = input_ids.len();
+
+        let embeds_cpu = cpu_td.embed_ids(&input_ids);    // [seq_len, hidden], f32
+        // Splice in audio embeddings at the audio_token positions.
+        let mut embed_vals = embeds_cpu.data;
+        let mut audio_idx = 0usize;
+        for (tok_idx, &tok_id) in input_ids.iter().enumerate() {
+            if tok_id == audio_token_id as i64 {
+                let dst = tok_idx * hidden_size;
+                let src = audio_idx * hidden_size;
+                for j in 0..hidden_size {
+                    // f32 round-trip via f16 to match the CUDA path's f16→f32→f16 fidelity.
+                    embed_vals[dst + j] = f16::from_f32(audio_embeds_data[src + j].to_f32()).to_f32();
+                }
+                audio_idx += 1;
+            }
+        }
+        // Wrap as [1, seq_len, hidden] for the decoder.
+        let inputs_embeds_cpu = CpuTensor::new(embed_vals, vec![1, seq_len, hidden_size]);
+        profile.mark("merge_embeddings");
+
+        // 8. MRoPE cos/sin (CPU) ─────────────────────────────
+        let text_cfg = &self.config.thinker_config.text_config;
+        let all_pos: Vec<i64> = (0..seq_len as i64).collect();
+        let pos_3d: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
+        let (cos_cpu, sin_cpu) = crate::cpu_engine::compute_mrope_cos_sin(
+            &pos_3d, text_cfg.head_dim, text_cfg.rope_theta,
+            &text_cfg.mrope_section(), text_cfg.mrope_interleaved(),
+        );
+        profile.mark("rope_compute");
+
+        // 9. 28-layer text decoder forward (CPU) ─────────────
+        let max_seq: usize = seq_len + 64;
+        let nkvh = text_cfg.num_key_value_heads;
+        let hd = text_cfg.head_dim;
+        let mut kv = CpuKvCache::new(text_cfg.num_hidden_layers, 1, nkvh, max_seq, hd);
+        let logits_full = cpu_td.forward(inputs_embeds_cpu, &cos_cpu, &sin_cpu, &mut kv, 0, true, false);
+        // logits_full: [1, seq_len, classify_num] (f32)
+        profile.mark("text_decoder");
+
+        // 10. Gather timestamp logits via row indexing.
+        let classify_num = logits_full.shape()[2];
+        // We want rows at timestamp_positions.  The CpuTensor underlying memory
+        // is contiguous, so a single memmove per row is fine.
+        let mut logits_f32: Vec<f32> = Vec::with_capacity(timestamp_positions.len() * classify_num);
+        for &pos in &timestamp_positions {
+            let base = pos * classify_num;
+            logits_f32.extend_from_slice(&logits_full.data[base..base + classify_num]);
+        }
+        profile.mark("timestamp_logits");
+
+        // 11. Argmax with f16 tie-breaking
+        let output_ids = argmax_rows(&logits_f32, classify_num);
+
+        // 12. Timestamp fix
+        let result = timestamp_ids_to_run(&words, &output_ids, self.config.timestamp_segment_time)?;
+        profile.mark("total");
+
+        Ok(result)
     }
 }
 
@@ -475,7 +587,7 @@ fn load_cpu_backend(
     let text_decoder = crate::cpu_engine::CpuTextDecoder::load(
         weight_data, "thinker.model", &config.thinker_config.text_config,
     ).context("load CPU text decoder")?;
-    info!("Loading CPU audio encoder (stub; calls bail at run time)...");
+    info!("Loading CPU audio encoder (conv stem + 24 layers)...");
     let audio_encoder = crate::cpu_engine::CpuAudioEncoder::load(
         weight_data, "thinker.audio_tower", &config.thinker_config.audio_config,
     ).context("load CPU audio encoder")?;
