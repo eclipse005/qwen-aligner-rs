@@ -920,13 +920,21 @@ impl CpuConvStem {
     /// Run conv stem on chunked mel input [b_chunks, 1, n_mels, cs].
     /// Returns (output, t2) where output is [b_chunks, t2, d_model] (with PE added).
     fn forward(&self, mel_chunks: &[f16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(CpuTensor, usize)> {
+        let t = sub_t0();
         // mel_packed: [b_chunks, 1, n_mels, cs] in NCHW.  Convert to f32.
         let x_data: Vec<f32> = mel_chunks.iter().map(|v| v.to_f32()).collect();
         let x = CpuTensor::new(x_data, vec![b_chunks, 1, n_mels, cs]);
 
+        let t0 = sub_t0();
         let x = self.conv1.forward_gelu(&x);
+        let dt_conv1 = sub_ms(t0);
+        let t0 = sub_t0();
         let x = self.conv2.forward_gelu(&x);
+        let dt_conv2 = sub_ms(t0);
+        let t0 = sub_t0();
         let x = self.conv3.forward_gelu(&x);
+        let dt_conv3 = sub_ms(t0);
+        let t0 = sub_t0();
         // x: [b_chunks, c3_out, f2, t2].  Permute → [b_chunks, t2, c3_out*f2] for the linear.
         let xs = x.shape();
         let (b, c, fo, t2) = (xs[0], xs[1], xs[2], xs[3]);
@@ -945,6 +953,7 @@ impl CpuConvStem {
                 }
             }
         }
+        let dt_perm = sub_ms(t0);
         // conv_out linear: W is [d_model, c*f2].  out = perm @ W^T.
         // The conv_out weight's second dim is c3 * n_mels_out (per the standard fixed
         // size), so we can build a CpuWeight once and reuse.
@@ -960,8 +969,10 @@ impl CpuConvStem {
         // for both full and tail chunks (the t-dim shrinks, not the f-dim).
         // So the same weight applies for every chunk.  Good — we built it once in load.
         let co = self.conv_out.forward(&perm_2d);
+        let dt_conv_out = sub_ms(t0);
         // co: [b*t2, d_model].  Add PE row it (broadcast over b).
         // Match candle's f16_add: quantise both operands and the result through f16.
+        let t0 = sub_t0();
         let mut out = co.data.clone();
         for ib in 0..b {
             for it in 0..t2 {
@@ -973,6 +984,11 @@ impl CpuConvStem {
                     out[base + j] = f16::from_f32(a + b).to_f32();
                 }
             }
+        }
+        let dt_pe = sub_ms(t0);
+        if sub_profile_enabled() {
+            eprintln!("  conv_stem dt: conv1={:.1} conv2={:.1} conv3={:.1} perm={:.1} conv_out={:.1} pe={:.1} ms (total {:.1})",
+                dt_conv1, dt_conv2, dt_conv3, dt_perm, dt_conv_out, dt_pe, sub_ms(t));
         }
         Ok((CpuTensor::new(out, vec![b, t2, self.d_model]), t2))
     }
