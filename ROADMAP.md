@@ -12,29 +12,37 @@ CPU 路径用 gemm crate + rayon。
 姊妹项目：`D:\qwen3-asr`（同架构 ASR 模型，已做完类似抽象）。
 
 ---
-## 当前状态（commit `7633431`）
+## 当前状态（commit `441af06`）
 
 ### 性能（P104-100, Pascal sm_61, 8GB, 无 tensor core / Arrow Lake 24c AVX2+FMA）
 
-纯推理时间（不含 ~5s 模型加载）：
+纯推理时间（不含 ~5s 模型加载），median of 10 runs on each fixture:
 
 | Device | Fixture | 时长 | 推理耗时 | RTFx |
 |--------|---------|------|----------|------|
 | CUDA | 15s (EN) | 15s | 0.21s | ~71x |
 | CUDA | 180s (EN) | 180s | 4.69s | **38.4x** |
 | CUDA | ko_4m (KO) | 267s | 4.98s | **53.5x** |
-| CPU | 15s (EN) | 15s | **1.22s** | **12.3x** |
-| CPU | 180s (EN) | 180s | **29.9s** | **6.0x** |
-| CPU | ko_4m (KO) | 267s | ~50s | ~5.3x |
+| CPU | 15s (EN) | 15s | **~1.0s** | **~14.6x** |
+| CPU | 180s (EN) | 180s | **~25.8s** | **~7.0x** |
 
-> CPU 数字来自 commit `7633431`（P0-1 + P1-2 v2 + P2-1 v1）。本会话相对 P0 之前的 baseline (CPU 15s 2.28s / 180s 49.5s) 提速：15s 1.87x，180s 1.66x。
-> P2-1 v1 把 audio_encoder 12.5s → 9.2s (1.36x)，主要靠 conv stem 8x (3 个 conv + bias+GELU)：
-> gemm crate 5.6s → SIMD AVX2+FMA 1-row matmul + parallel bias+GELU → 3.3s (180s conv2)，conv1 0.9s → 0.2s，conv3 1.4s → 0.7s。
-> 进一步缩 conv2 matmul 试过 4-row + (c_out_chunk, row_block) 并行，没改善（甚至微回归，cache 压力更大），
-> 试过 8-row 同样。skinny matmul (m=30, k=270, n=144K) 的 gemm 已是甜点，要继续压需要 NHWC + direct conv。
+> CPU 数字来自本会话（`eb52f63` + `c5add06` + `441af06`）。本会话相对上轮 (`7633431`)：
+> - 15s: 1.22s → ~1.0s (1.22x)
+> - 180s: 29.9s → ~25.8s (1.16x)
+> 关键新工作：
+> - `eb52f63` P3-2: SIMD-ize audio matmul_qk/av (用 dot_qk_avx2/axpy_avx2 helper)。audio attn inner 80ms→70ms/层 (24 层)。
+> - `c5add06` P4-1: conv stem NHWC direct conv (用 [f32; 512] accs + load+FMA+store 1-row 8-col microkernel)。conv2 3050ms→1700ms (180s)，省 1.5s。
+> - `441af06` 文档：P4-2 register-accumulator 尝试失败，1-row L1 accs 是当前甜点。
+>
+> 本会话试过但 rejected（性能反而下降）：
+> - 4-row / 2-row Q@K microkernel in prefill_attention：L1 写 stride 破坏 prefetcher pattern
+> - P4-2 __m256 register accumulator: [f32; 8] copy_from_slice 开销超过 L1 节省
+> - Conv stem 4-row / 8-row microkernel: im2col 缓存压力
+>
+> 已相对 baseline (commit `f0fdff0` 之前, 15s 2.28s / 180s 49.5s) 总提速：15s 2.21x，180s 1.92x。
 
-- CUDA: 所有 fixture 与重构前 candle baseline 完全一致（15s 40/40, 180s 909/909, ko_4m 189/189）
-- CPU: 15s 40/40 与 CUDA 一致；180s/ko_4m 有 CPU 音频编码器边界处理的已知微小差异
+> 40/40 EXACT 在 15s fixture 验证。conv stem 180s 边界处理有 CPU 已知微小差异（不影响 alignment 质量）。
+</input>
 
 ### 架构（重构后）
 
@@ -73,43 +81,50 @@ src/
 | `11bb061` | docs: update ROADMAP with P1-2 v2 results and P2 reordering |
 | `51cae2f` | feat(cpu): add audio FFN + LayerNorm sub-profile (audio_encoder sub-stage timing) |
 | `0f4799a` | feat(cpu): add CpuConvStem sub-profile (per-conv + perm + conv_out + PE timing) |
-| `7633431` | **CPU conv stem SIMD + parallel bias+GELU (P2-1 v1)** — 替换 gemm crate 的 5.6s conv2 matmul (180s) 为 8-wide AVX2+FMA 1-row kernel，权重 load-time 转置到 [c_in*9, c_out] 让 8 c_out SIMD load 连续；bias+GELU 改 rayon 并行消灭 4.32M scalar libm::erff。180s: conv stem 7.95s→4.5s (1.76x), audio_encoder 12.5s→9.2s (1.36x), total 30.2s→28.6s (RTFx 5.96→6.0x). 15s 1.48s→1.19s (1.24x). *4-row kernel 试过反而微回归（im2col cache 压力）；要继续缩 conv2 需 NHWC + direct conv 大改* |
-
+| `eb52f63` | **CPU audio matmul_qk/av SIMD (P3-2)** — 用 prefill_attention 同套 dot_qk_avx2/axpy_avx2 helper 替换 audio encoder 24 层的 matmul_qk/av 里的 gemm call。audio attn inner 80ms→70ms/层 (180s)。15s 1.10s, 180s 26.7s |
+| `bb179f9` | docs: 标注 prefill_attention 4-row / 2-row / P4-2 尝试均 rejected |
+| `c5add06` | **CPU conv stem NHWC direct conv (P4-1)** — NCHW→NHWC 转置 + 1-row 8-col microkernel 取代 im2col + 1-row 8-col matmul。3x3 gather 内联进 FMA inner loop，省 389ms 标量 im2col (180s)。180s conv2 3050ms→1700ms, audio_encoder 9.2s→6.9-7.3s, total 27.1s→25.8s (1.05x). 15s 1.10s→1.03s. *4-row / 8-row P2-1 试过 (rejected) 后, P4-2 [f32; 8] / [__m256; 16] 寄存器累计也试过 (rejected - copy_from_slice 开销超过 L1 节省)* |
+| `441af06` | docs: 标注 P4-2 寄存器累计尝试失败, P4-1 L1 accs 是当前甜点 |
+</input>
 ### 1. CPU 性能优化（**进行中** — 越快越好，无预设上限）
 
-当前瓶颈（180s EN 推理 ~29.9s，commit `7633431`）：
+当前瓶颈（180s EN 推理 ~25.8s median of 10，commit `441af06`）：
 
 | 组件 | 耗时 | 占比 | 备注 |
-| text_decoder | **~19.5s** | **~65%** | 28 层 prefill；P1-2 v2 后 attn ~15s，4 GEMM ~3.5s，elementwise ~1s |
-| audio_encoder | **~9.2s** | **~31%** | P2-1 v1 后 conv stem 4.5s（conv2 matmul 3.3s 仍瓶颈）+ 24 音频层 ~3.0s + conv_out+PE ~0.06s |
+| text_decoder | **~17.6s** | **~68%** | 28 层 prefill；P1-2 v2 + 4 GEMM + RMSN/elementwise。attn inner ~480-510ms/层（K reads 主导） |
+| audio_encoder | **~7.0s** | **~27%** | P4-1 NHWC direct conv 后 conv_stem ~2.4-2.5s (conv2 1.7-1.8s 仍主导) + 24 音频层 (attn 1.7s + ffn 0.9s) + conv_out+PE ~0.07s |
 | prepare_input | 0.2s | <1% | 已是噪声 |
 
-audio_encoder 9.2s 内部分解（commit `0f4799a` + `7633431`）：
+audio_encoder 7.0s 内部分解（commit `c5add06`）：
 | 子阶段 | 耗时 | 备注 |
 |--------|------|------|
-| conv1 | 0.15s | c_in=1，cache 友好 |
-| **conv2** | **3.3s** | m=30, n=144K, k=270 — gemm crate / SIMD 1-row 都是这数，skinny matmul 极限 |
-| conv3 | 0.7s | m=30, n=36K, k=270 |
+| conv1 | 0.15s | c_in=1, c_out=480 |
+| **conv2** | **1.7-1.8s** | m=30, n=144K, k=270, c_out=480 — P4-1 L1 accs +W 读 (W=518KB, L2) 主导。P4-2 [__m256; 16] 寄存器轮 rejected |
+| conv3 | 0.45-0.5s | m=30, n=36K, k=270, c_out=480 |
 | perm | 0.02s | |
 | conv_out + PE | 0.06s | |
-| 24 音频层 (LN + attn + ffn) | ~3.0s | attn 2.0s + ffn 1.0s |
+| 24 音频层 (LN + attn + ffn) | ~3.0s | attn 1.7s (SIMD Q@K/A@V) + ffn 0.9s + 24×LN |
 
 已完成 / 跳过：
-- ✅ P0-1 f16→f32 预转换 (`f0fdff0`)：text_decoder/audio_encoder 一次 upcast，热路径纯 f32
-- ✅ P0-2 elementwise SIMD：**跳过**（elementwise <5% 总时间）
-- ✅ P1-0 sub-profile (`f4de5cb`)：诊断出 attn 87% text_decoder
-- ✅ P1-1 matrixmultiply crate：**跳过**（K=128 skinny matmul 跟 P1-2 v1 同样风险，gemm 已是甜点）
-- ✅ P1-2 v1 gemm crate 替换 prefill_attention：rejected（K=128 反而 3.6x 慢）
-- ✅ P1-2 v2 AVX2+FMA SIMD (`43ae896`)：attn 26s → 15s, text_decoder 1.58x
-- ✅ P2-0 audio FFN+LN sub-profile (`51cae2f`)：24 层 ~126ms/层 = 3.0s
-- ✅ P2-0.5 conv stem sub-profile (`0f4799a`)：conv2 是 9.2s 中 3.3s
-- ✅ P2-1 v1 conv stem SIMD + parallel GELU (`7633431`)：conv stem 7.95s→4.5s (1.76x)，4-row 试过反而微回归（im2col cache 压力）
+ ✅ P0-1 f16→f32 预转换 (`f0fdff0`)：text_decoder/audio_encoder 一次 upcast，热路径纯 f32
+ ✅ P0-2 elementwise SIMD：**跳过**（elementwise <5% 总时间）
+ ✅ P1-0 sub-profile (`f4de5cb`)：诊断出 attn 87% text_decoder
+ ✅ P1-1 matrixmultiply crate：**跳过**（K=128 skinny matmul 跟 P1-2 v1 同样风险，gemm 已是甜点）
+ ✅ P1-2 v1 gemm crate 替换 prefill_attention：rejected（K=128 反而 3.6x 慢）
+ ✅ P1-2 v2 AVX2+FMA SIMD (`43ae896`)：attn 26s → 15s, text_decoder 1.58x
+ ✅ P2-0 audio FFN+LN sub-profile (`51cae2f`)：24 层 ~126ms/层 = 3.0s
+ ✅ P2-0.5 conv stem sub-profile (`0f4799a`)：conv2 是 9.2s 中 3.3s
+ ✅ P2-1 v1 conv stem SIMD + parallel GELU (`7633431`)：conv stem 7.95s→4.5s, 4-row 试过反而微回归（im2col cache 压力）
+ ✅ P3-2 audio matmul_qk/av SIMD (`eb52f63`)：audio attn inner 80ms→70ms/层 (180s)
+ ✅ P4-1 conv stem NHWC direct conv (`c5add06`)：conv2 3050ms→1700ms (1.79x)
+ ❌ P4-2 conv stem register accumulator ([f32; 8] / [__m256; 16]) (`441af06`)：rejected - copy_from_slice 开销超过 L1 节省
+ ❌ prefill_attention 4-row / 2-row Q@K microkernel (`bb179f9`)：rejected - 2/4 strided 写到 scores 破坏 L1 prefetcher pattern
 
-下一步（按 ROI 排序）：
-- **NHWC + direct conv**（conv stem 进一步压到 ~0.5s 的唯一办法，估 audio_encoder → ~5.5s，total 180s → ~25s，RTFx ~7.2x）
-- **P3-1: MLP 融合**（silu_mul+down_proj 中间张量消除，估 5-10% on text_decoder）
-- **P2-2: 跨 chunk 并行**（音频 encoder chunk 维并行，但需 conv stem 改 NHWC 后才有效）
-
+下一步（按 ROI 排序，但已越来越难）：
+ **prefill_attention 重构为 batched t 或新 layout**：可能省 5-7s on 180s (text_decoder attn)。但 4-row / 2-row 都试过失败，需要根本性重写（FlashAttention 风格或 shared K/V across heads）。**高风险/高回报**
+ **P2-2 跨 chunk 并行**：音频 encoder 30 chunks 维并行，但 conv stem 改完 NHWC 后才行；可能要重写 audio forward。
+ **P3-1 MLP 融合**：silu_mul+down_proj 中间张量消除，估 5-10% on text_decoder (~1s)，**中 ROI**
+ **conv stem NHWC 进一步优化**：P4-2 register accumulator 需重做（用 `repr(C, align(32))` 的 [f32; 8] 包装 __m256），估计 1.7s→0.5s (省 1.2s)。**高复杂度**
 ### 2. CUDA 性能优化（**进行中** — 越快越好，无预设上限）
 
 当前瓶颈（180s EN 推理 4.69s）：
