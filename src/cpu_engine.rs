@@ -707,10 +707,11 @@ fn conv_row_tail_t(
 /// patches from the NHWC tensor and FMA-accumulating against the
 /// transposed weight (laid out as [c_in*9, c_out] at load, which is
 /// also [c_in, kh*kw, c_out] in row-major).  Returns the full c_out in
-/// a stack buffer of fixed size 512 (c_out must be <= 512).  The
-/// load+FMA+store pattern keeps all c_out chunks live through the inner
-/// (ic, kk) loop, trading 1 accs load + store per FMA for not having to
-/// spill YMM registers when c_out > 128 (=16 YMM, the AVX2 limit).
+/// a stack buffer of fixed size 512 (c_out must be <= 512) using the
+/// load+FMA+store pattern.  P4-2 attempt with [[f32;8]; 16] scratch
+/// buffers (intended to live in YMM registers) was slower than this
+/// version because the [f32; 8] copy_from_slice + loadu_ps overhead
+/// exceeds the savings from keeping the accumulator out of L1.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn conv_nhwc_direct(
@@ -752,7 +753,6 @@ unsafe fn conv_nhwc_direct(
     }
     accs
 }
-
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -853,7 +853,6 @@ impl CpuConv2d {
         // pointers are !Sync, blocking rayon parallelism).
         let w_t_addr = w_t.data.as_ptr() as usize;
         let x_addr = x_nhwc.as_ptr() as usize;
-        eprintln!("DEBUG forward_gelu: about to matmul loop, n_rows={}", n_rows);
         use rayon::prelude::*;
         matmul_out.par_chunks_mut(c_out).enumerate().for_each(|(row, row_slice)| {
             let ib = row / (f_out * t_out);
@@ -871,6 +870,8 @@ impl CpuConv2d {
                 unsafe { *row_out.add(c_out_idx) = accs[c_out_idx]; }
             }
         });
+        // Bias add + GELU (exact erf via libm) into the NCHW output, parallel
+        // over (ib, c) chunks of f_out * t_out elements each.  Output shape
         // is [b, c_out, f_out, t_out] (NCHW), so c_slab is one (ib, c) plane.
         let bias = self.bias.as_ref().unwrap();
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;

@@ -12,3 +12,5 @@
 
 # Test fixtures (audio/text) and any integration tests — local-only.
 /tests/
+bench_*.json
+!bench_outputs/
