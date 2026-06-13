@@ -20,15 +20,13 @@ CPU 路径用 gemm crate + rayon。
 
 | Device | Fixture | 时长 | 推理耗时 | RTFx |
 |--------|---------|------|----------|------|
-| CUDA | 15s (EN) | 15s | 0.21s | ~71x |
-| CUDA | 180s (EN) | 180s | 4.69s | **38.4x** |
-| CUDA | ko_4m (KO) | 267s | 4.98s | **53.5x** |
-| CPU | 15s (EN) | 15s | **~1.0s** | **~14.6x** |
-| CPU | 180s (EN) | 180s | **~25.8s** | **~7.0x** |
-
-> CPU 数字来自本会话（`eb52f63` + `c5add06` + `441af06`）。本会话相对上轮 (`7633431`)：
-> - 15s: 1.22s → ~1.0s (1.22x)
-> - 180s: 29.9s → ~25.8s (1.16x)
+| CPU | 15s (EN) | 15s | **~0.97s** | **~15.5x** |
+| CPU | 180s (EN) | 180s | **~24.9s** | **~7.2x** |
+</input>
+> CPU 数字来自本会话（`eb52f63` + `c5add06` + `441af06` + `30afdec`），median of 10 runs。本会话相对上轮 (`7633431`)：
+> - 15s: 1.22s → ~0.97s (1.26x)
+> - 180s: 29.9s → ~24.9s (1.20x)
+</input>
 > 关键新工作：
 > - `eb52f63` P3-2: SIMD-ize audio matmul_qk/av (用 dot_qk_avx2/axpy_avx2 helper)。audio attn inner 80ms→70ms/层 (24 层)。
 > - `c5add06` P4-1: conv stem NHWC direct conv (用 [f32; 512] accs + load+FMA+store 1-row 8-col microkernel)。conv2 3050ms→1700ms (180s)，省 1.5s。
@@ -39,7 +37,8 @@ CPU 路径用 gemm crate + rayon。
 > - P4-2 __m256 register accumulator: [f32; 8] copy_from_slice 开销超过 L1 节省
 > - Conv stem 4-row / 8-row microkernel: im2col 缓存压力
 >
-> 已相对 baseline (commit `f0fdff0` 之前, 15s 2.28s / 180s 49.5s) 总提速：15s 2.21x，180s 1.92x。
+> 已相对 baseline (commit `f0fdff0` 之前, 15s 2.28s / 180s 49.5s) 总提速：15s 2.35x，180s 1.99x。
+</input>
 
 > 40/40 EXACT 在 15s fixture 验证。conv stem 180s 边界处理有 CPU 已知微小差异（不影响 alignment 质量）。
 </input>
