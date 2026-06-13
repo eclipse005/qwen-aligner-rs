@@ -568,7 +568,10 @@ fn prefill_attention(
         }
 
         // Q @ K^T: per-head [s, hd] @ [hd, s] -> [s, s].  Causal mask in inner
-        // loop.  Inner dot product is 8-wide FMA.
+        // loop.  Inner dot product is 8-wide FMA.  Tried 4-row microkernel
+        // (dot4_qk_avx2) which saves K cache reads, but the 4 strided writes
+        // to scores (one per i in the block) thrash the L1 more than the
+        // K-read savings are worth; net 4-row is slower.  Keep 1-row.
         let mut scores = vec![0.0f32; s * cur_len];
         for i in 0..s {
             let qi = &q_qh[i * hd..(i + 1) * hd];
@@ -595,8 +598,11 @@ fn prefill_attention(
             let inv = 1.0 / sum;
             for v in row.iter_mut() { *v *= inv; }
         }
-        // Scores @ V: per-head [s, s] @ [s, hd] -> [s, hd].  Weighted sum
-        // (out_i += w * v_t) is 8-wide FMA per (i, t) pair.
+        // Scores @ V: kept at 1-row microkernel.  The 4-row version (axpy4_avx2)
+        // saves V cache reads but the 4 OUT[i, :] rows are stride-hd apart in
+        // the OUT tensor (each at its own head's [b, s, nqh, hd] position) and
+        // the L1 prefetcher handles the single-row sequential pattern much
+        // better than 4 strided rows.  Net: 1-row is faster here.
         let out_ptr = out.as_ptr() as *mut f32;
         for i in 0..s {
             let dst_off = ((ib * s + i) * nqh + qh) * hd;
@@ -696,6 +702,59 @@ fn conv_row_tail_t(
     acc
 }
 
+/// P4-1: NHWC direct 3x3 conv kernel — 1-row x 8-col microkernel.
+/// Computes c_out values for one (b, fo, to) by gathering the 9 input
+/// patches from the NHWC tensor and FMA-accumulating against the
+/// transposed weight (laid out as [c_in*9, c_out] at load, which is
+/// also [c_in, kh*kw, c_out] in row-major).  Returns the full c_out in
+/// a stack buffer of fixed size 512 (c_out must be <= 512).  The
+/// load+FMA+store pattern keeps all c_out chunks live through the inner
+/// (ic, kk) loop, trading 1 accs load + store per FMA for not having to
+/// spill YMM registers when c_out > 128 (=16 YMM, the AVX2 limit).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn conv_nhwc_direct(
+    x_ptr: *const f32,
+    w_ptr: *const f32,
+    c_in: usize, c_out: usize, n_full: usize,
+    b: usize, f: usize, t: usize,
+    ifo: usize, ito: usize,
+) -> [f32; 512] {
+    use std::arch::x86_64::*;
+    debug_assert!(c_out <= 512);
+    let mut accs = [0.0f32; 512];
+    let f0 = ifo * 2;
+    let t0 = ito * 2;
+    for ic in 0..c_in {
+        for kk in 0..9usize {
+            let kh = kk / 3;
+            let kw = kk % 3;
+            let f_in_signed = f0 as i32 + kh as i32 - 1;
+            let t_in_signed = t0 as i32 + kw as i32 - 1;
+            let x_val = if f_in_signed >= 0 && f_in_signed < f as i32
+                && t_in_signed >= 0 && t_in_signed < t as i32
+            {
+                *x_ptr.add((b * f + f_in_signed as usize) * t * c_in
+                    + t_in_signed as usize * c_in + ic)
+            } else {
+                0.0
+            };
+            for c_out_base in (0..n_full).step_by(8) {
+                let w_vec = _mm256_loadu_ps(w_ptr.add((ic * 9 + kk) * c_out + c_out_base));
+                let acc_vec = _mm256_loadu_ps(accs.as_ptr().add(c_out_base));
+                let new_acc = _mm256_fmadd_ps(w_vec, _mm256_set1_ps(x_val), acc_vec);
+                _mm256_storeu_ps(accs.as_mut_ptr().add(c_out_base), new_acc);
+            }
+            for c_out_idx in n_full..c_out {
+                accs[c_out_idx] += x_val * *w_ptr.add((ic * 9 + kk) * c_out + c_out_idx);
+            }
+        }
+    }
+    accs
+}
+
+
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Audio encoder — full CPU port mirroring gpu_audio_encoder.rs
 // ═══════════════════════════════════════════════════════════════════════
@@ -764,74 +823,54 @@ impl CpuConv2d {
         //   out_len = floor((in_len + 2*1 - 3) / 2) + 1 = floor((in_len - 1) / 2) + 1
         let f_out = (f - 1) / 2 + 1;
         let t_out = (t - 1) / 2 + 1;
-        // Im2col: for each (b, f_out, t_out), gather a 3x3 patch of all c_in channels
-        // → row of length c_in*9.  Total rows = b * f_out * t_out.
-        // gemm: y[c_out, c_in*9] @ X[c_in*9, b*f_out*t_out] = out[c_out, b*f_out*t_out]
-        // then add bias, GELU, reshape to [b, c_out, f_out, t_out].
-        let cols_per_row = c_in * 9;
+        // The NCHW input is transposed to NHWC (~0.2ms for 180s conv2),
+        // then the 1-row x 8-col direct conv (conv_nhwc_direct) replaces
+        // both the im2col buffer and the gemm-style matmul.  Inner FMA
+        // loop is c_in*9 = 270 terms; the 8-wide broadcast of x and
+        // 8-wide load of w reads 8 c_out values per (ic, kh*kw) — same
+        // memory pattern as P2-1 but with no im2col materialization
+        // (saves ~389ms of scalar gather on 180s conv2) and no row-tile
+        // cache-pressure issues.  Output is (n_rows, c_out) row-major
+        // matching the old matmul_out, so the bias + GELU tail is
+        // unchanged.
         let n_rows = b * f_out * t_out;
-        let mut im2col = vec![0.0f32; n_rows * cols_per_row];
-        for ib in 0..b {
-            for ifo in 0..f_out {
-                let f0 = ifo * 2;       // top-left of the receptive window in input
-                for ito in 0..t_out {
-                    let t0 = ito * 2;
-                    let row = (ib * f_out + ifo) * t_out + ito;
-                    let mut col = 0;
-                    for c in 0..c_in {
-                        for kh in 0..3 {
-                            for kw in 0..3 {
-                                let f_in = f0 + kh - 1;   // pad=1
-                                let t_in = t0 + kw - 1;
-                                let v = if f_in < f && t_in < t {
-                                    x.data[((ib * c_in + c) * f + f_in) * t + t_in]
-                                } else {
-                                    0.0
-                                };
-                                im2col[row * cols_per_row + col] = v;
-                                col += 1;
-                            }
-                        }
-                    }
+        let mut matmul_out = vec![0.0f32; n_rows * c_out];
+        // NCHW [b, c_in, f, t] → NHWC [b, f, t, c_in].  Parallel over
+        // (b, f) chunks of t*c_in elements.
+        let mut x_nhwc = vec![0.0f32; b * f * t * c_in];
+        x_nhwc.par_chunks_mut(t * c_in).enumerate().for_each(|(bf, x_bf)| {
+            let ib = bf / f;
+            let if_ = bf % f;
+            for it in 0..t {
+                for ic in 0..c_in {
+                    x_bf[it * c_in + ic] = x.data[((ib * c_in + ic) * f + if_) * t + it];
                 }
             }
-        }
-        // ── P2-1: replace gemm crate with direct AVX2+FMA, then parallel
-        // bias+GELU on the row-major output.  The gemm crate on this conv
-        // shape (m=30, n=144K, k=270) was 40x slower than the text decoder's
-        // GEMM because matrixmultiply is tuned for square-ish shapes and
-        // 5.6s of 12.6s audio_encoder on 180s was the gemm alone.  The custom
-        // 8-wide FMA matmul on the [c_in*9, c_out] transposed weight runs in
-        // single-digit ms per conv, and the bias+GELU loop is parallelised
-        // over (ib, c) to collapse 4.32M scalar libm::erff calls (~5s on
-        // 180s) into ~14ms.
+        });
         let w_t = &self.weight;            // [c_in*9, c_out] row-major (transposed at load)
-        let cols = cols_per_row;
-        let c_out_chunks = c_out / 8;
-        let c_out_tail_start = c_out_chunks * 8;
-        let mut matmul_out = vec![0.0f32; n_rows * c_out];
-        // Pass pointers as usize so the closure satisfies Sync (raw pointers
-        // are !Sync, blocking rayon parallelism).
+        let n_full = (c_out / 8) * 8;
+        // Pass pointers as usize so the closure satisfies Sync (raw
+        // pointers are !Sync, blocking rayon parallelism).
         let w_t_addr = w_t.data.as_ptr() as usize;
-        let im2col_addr = im2col.as_ptr() as usize;
+        let x_addr = x_nhwc.as_ptr() as usize;
+        eprintln!("DEBUG forward_gelu: about to matmul loop, n_rows={}", n_rows);
         use rayon::prelude::*;
-        matmul_out.par_chunks_mut(c_out).enumerate().for_each(|(row, row_slice)| unsafe {
-            use std::arch::x86_64::*;
-            let row_in = (im2col_addr as *const f32).add(row * cols);
+        matmul_out.par_chunks_mut(c_out).enumerate().for_each(|(row, row_slice)| {
+            let ib = row / (f_out * t_out);
+            let rem = row % (f_out * t_out);
+            let ifo = rem / t_out;
+            let ito = rem % t_out;
+            let accs = unsafe {
+                conv_nhwc_direct(
+                    x_addr as *const f32, w_t_addr as *const f32,
+                    c_in, c_out, n_full, ib, f, t, ifo, ito,
+                )
+            };
             let row_out = row_slice.as_mut_ptr();
-            let w_t_ptr = w_t_addr as *const f32;
-            // Full 8-wide chunks
-            for chunk_idx in 0..c_out_chunks {
-                let acc = conv_row_8cols(row_in, w_t_ptr, cols, c_out, chunk_idx * 8);
-                _mm256_storeu_ps(row_out.add(chunk_idx * 8), acc);
-            }
-            // Tail (c_out_tail_start..c_out) — scalar
-            for c_out_idx in c_out_tail_start..c_out {
-                *row_out.add(c_out_idx) = conv_row_tail_t(&im2col, &w_t.data, row, cols, c_out, c_out_idx);
+            for c_out_idx in 0..c_out {
+                unsafe { *row_out.add(c_out_idx) = accs[c_out_idx]; }
             }
         });
-        // Bias add + GELU (exact erf via libm) into the NCHW output, parallel
-        // over (ib, c) chunks of f_out * t_out elements each.  Output shape
         // is [b, c_out, f_out, t_out] (NCHW), so c_slab is one (ib, c) plane.
         let bias = self.bias.as_ref().unwrap();
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
@@ -965,7 +1004,6 @@ impl CpuConvStem {
         // mel_packed: [b_chunks, 1, n_mels, cs] in NCHW.  Convert to f32.
         let x_data: Vec<f32> = mel_chunks.iter().map(|v| v.to_f32()).collect();
         let x = CpuTensor::new(x_data, vec![b_chunks, 1, n_mels, cs]);
-
         let t0 = sub_t0();
         let x = self.conv1.forward_gelu(&x);
         let dt_conv1 = sub_ms(t0);
