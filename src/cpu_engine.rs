@@ -405,8 +405,9 @@ pub(crate) fn swap_dims_12(x: &CpuTensor) -> CpuTensor {
     CpuTensor::new(out, vec![d0, d2, d1, d3])
 }
 
-/// Q @ K^T for [b, nh, s, hd] layout, returns [b, nh, s, s].
-/// Per (b, nh), one gemm call (m=s, n=s, k=hd).
+/// Q @ K^T for [b, nh, s, hd] layout, returns [b, nh, s, s] (head-contig bytes).
+/// Per (b, nh) head, inner loop is `dot_qk_avx2` (8-wide FMA over the hd dim).
+/// Used by the audio encoder (s ≈ 80, hd = 64 → 8 microkernel iters per dot).
 pub(crate) fn matmul_qk(q: &CpuTensor, k: &CpuTensor) -> CpuTensor {
     let qs = q.shape();
     let (b, nh, s, hd) = (qs[0], qs[1], qs[2], qs[3]);
@@ -416,37 +417,21 @@ pub(crate) fn matmul_qk(q: &CpuTensor, k: &CpuTensor) -> CpuTensor {
         let ih = idx % nh;
         let q_off = (ib * nh + ih) * s * hd;
         let k_off = (ib * nh + ih) * s * hd;
-        // gemm: m=s, n=s, k=hd.  Output is row-major [s, s]: out[i, j] = sum_k q[i, k] * k[j, k].
-        // cs for j+1 is 1, rs for i+1 is s.  For k (b^T, i.e. transposed), element (i, j) = k[j, i]?
-        // — no, gemm computes A @ B (no transpose).  We want Q @ K^T, so B is conceptually
-        // [hd, s] with element (i, j) = K[j, i].  Since K is row-major [s, hd] with
-        // element (i, k) at i*hd + k, the B^T of that is [hd, s] with element (k, j) = K[j, k].
-        // We pass rhs as a [hd, s] view: rhs_cs=1, rhs_rs=hd is wrong for that; actually
-        // for rhs as [hd, s] row-major, element (i, j) = i*s + j: i+1 advances s, j+1 advances 1.
-        // K (row-major [s, hd]) data layout is identical to K^T ([hd, s] col-major) only if we
-        // swap cs and rs.  Concretely: pass rhs as the K data pointer with cs=hd, rs=1, which
-        // is what a transposed matrix view looks like in BLAS.
-        unsafe {
-            gemm(
-                s, s, hd,
-                slab.as_mut_ptr(),
-                1, s as isize,
-                false,
-                q.data.as_ptr().add(q_off),
-                1, hd as isize,
-                k.data.as_ptr().add(k_off),
-                hd as isize, 1,
-                0.0, 1.0,
-                false, false, false,
-                Parallelism::None,
-            );
+        for i in 0..s {
+            let q_row = &q.data[q_off + i * hd..q_off + (i + 1) * hd];
+            for t in 0..s {
+                let k_row = &k.data[k_off + t * hd..k_off + (t + 1) * hd];
+                slab[i * s + t] = unsafe { dot_qk_avx2(q_row, k_row) };
+            }
         }
     });
     CpuTensor::new(out, vec![b, nh, s, s])
 }
 
-/// Attention @ V: [b, nh, s, t] × [b, nh, t, hd] → [b, nh, s, hd] (bytes laid out
-/// [b, s, nh, hd] so the caller can reshape directly to [b, s, nqh*hd]).
+/// Attention @ V: [b, nh, s, t] × [b, nh, t, hd] → [b, nh, s, hd] (head-contig bytes;
+/// reshape + swap_dims_12 in the caller converts to [b, s, nqh*hd] for the next op).
+/// Per (b, nh) head, inner loop is `axpy_avx2` (8-wide FMA: out[i, :] += w * V[t, :])
+/// over t with one hd-wide FMA per t — for hd=64 that's 8 microkernel iters per axpy.
 pub(crate) fn matmul_av(attn: &CpuTensor, v: &CpuTensor) -> CpuTensor {
     let vs = v.shape();
     let (b, nh, t, hd) = (vs[0], vs[1], vs[2], vs[3]);
@@ -457,28 +442,19 @@ pub(crate) fn matmul_av(attn: &CpuTensor, v: &CpuTensor) -> CpuTensor {
         let ih = bn % nh;
         let a_off = (ib * nh + ih) * s * t;
         let v_off = (ib * nh + ih) * t * hd;
-        // m=s, n=hd, k=t.  Output is row-major [s, hd] with strides (1, hd).
-        // V is row-major [t, hd] with strides (1, hd), so pass as-is.
-        unsafe {
-            gemm(
-                s, hd, t,
-                slab.as_mut_ptr(),
-                1, hd as isize,
-                false,
-                attn.data.as_ptr().add(a_off),
-                1, t as isize,
-                v.data.as_ptr().add(v_off),
-                1, hd as isize,
-                0.0, 1.0,
-                false, false, false,
-                Parallelism::None,
-            );
+        for i in 0..s {
+            let attn_row = &attn.data[a_off + i * t..a_off + (i + 1) * t];
+            let out_i = &mut slab[i * hd..(i + 1) * hd];
+            for k in 0..t {
+                let w = attn_row[k];
+                if w == 0.0 { continue; }
+                let v_row = &v.data[v_off + k * hd..v_off + (k + 1) * hd];
+                unsafe { axpy_avx2(out_i, w, v_row); }
+            }
         }
     });
     CpuTensor::new(out, vec![b, nh, s, hd])
 }
-
-// ═══════════════════════════════════════════════════════════════════════
 //  Rotary embedding (in-place on a head row)
 // ═══════════════════════════════════════════════════════════════════════
 
