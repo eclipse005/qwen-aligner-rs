@@ -141,14 +141,40 @@ audio_encoder 7.0s 内部分解（commit `c5add06`）：
  **conv stem NHWC 进一步优化**：P4-2 register accumulator 需重做（用 `repr(C, align(32))` 的 [f32; 8] 包装 __m256），估计 1.7s→0.5s (省 1.2s)。**高复杂度**
 ### 2. CUDA 性能优化（**进行中** — 越快越好，无预设上限）
 
-当前瓶颈（180s EN 推理 4.69s）：
+当前瓶颈（180s EN 推理 **~5.14s** median of 3, P104-100 sm_61 8GB）:
 
-可能方向：
+| 阶段 | 耗时 | 占比 | 备注 |
+|------|------|------|------|
+| prepare_input | 0.25s | 5% | CPU mel/pack (无法 GPU 加速, 已是噪声) |
+| audio_encoder | 1.25s | 24% | conv stem + 24 层; conv stem 内有 3 处 CPU↔GPU roundtrip (见下) |
+| **text_decoder** | **3.6s** | **70%** | 28 层; 每层 qk(grouped GQA) **~130ms** + qkv ~10ms + mlp ~22ms + o ~5ms |
+| timestamp_logits | 0.04s | <1% | gather + download |
 
-- **Conv stem GPU permute**：消除 download→permute→upload 的 CPU roundtrip（~0.05-0.1s）。注意不要用自定义 kernel 做 copy（实测 cudarc launch overhead 很大）
-- **Grouped GQA 单次 GEMM**：当前 8×batch=2 小 GEMM，探索用单次 batch=16 + stride 实现
-- **cuBLAS GEMM 算法搜索**：对常用形状跑 algo0-6 选最优（预估 5-15%）
-- **MLP 融合**：silu_mul_split + down_proj 之间的中间张量消除
+每层 (sub-profile, 180s): `rmsn=1.7 qkv=10 **qk=130** softmax=0(fused) av=0(fused) o=5 mlp=22 ms`。
+**grouped GQA (`c188ddf`) 已落地**: 消除了 repeat_kv, 用 stride_a=0 batched GEMM 在 n_rep=2 个 sibling Q head 间共享 K/V。当前是 nkvh=8 次 strided_batched GEMM (batch=2 each) for QK + 同样 8 次 for AV。
+
+可能方向 (按实测 ROI 排序):
+
+**[高 ROI / 中风险] cuBLAS GEMM 算法搜索 — 预估省 0.4-0.7s (10-15% on text_decoder)**
+当前 safe `Gemm` trait 硬编码 `CUBLAS_GEMM_DEFAULT` (cudarc gemm.rs:95,137)。需绕过 safe API 直接调 `result::gemm_strided_batched_ex` 传 `cublasGemmAlgo_t::CUBLAS_GEMM_ALGO0..23`。对 QK 的 `m=n=5240, k=128, batch=2×8` 和 AV 的 `m=d=128, n=5240, k=5240, batch=2×8` 形状跑一遍 `cublasGemmEx` 的 algo0-23 + DEFAULT, 选最快。Pascal sm_61 上 cuBLAS 对每个 (shape, algo) 有不同 split-K / tile 策略, 实测某些 algo 比 DEFAULT 快 10-20%。**一次离线 profiling + 硬编码 algo 即可, 零运行时成本**。注意 bit-exact: 不同 algo 可能改变 f16 accumulate 顺序 → 需用 15s+180s 时间戳 gate 验证 (与 CPU flash 同一红线)。
+
+**[高 ROI / 中复杂度] Grouped GQA 单次 batch=16 GEMM 替代 8×batch=2 — 预估省 0.3-0.5s**
+当前 `grouped_gqa_prefill` (cudarc_engine.rs:368) 对 nkvh=8 组各发一次 `gemm_strided_batched(batch=2, stride_a=0)` = 8 次 cuBLAS 调用 (QK) + 8 次 (AV) = 16 次 launch/层 × 28 层 = 448 次 launch/forward。每次 launch 在 P104 上有 ~10-30μs overhead → 448×20μs ≈ 9ms 纯 launch 开销 (小头)。**真正收益是合并成 batch=16 单次调用让 cuBLAS 选更优 tile**: 但 GQA 的 stride_a=0 (K 共享) 不能直接用 batched (要求所有 batch 的 A stride 相同且非零)。需要重排 K/V 到 [nqh=16, s, d] (repeat K/V, 反而增加内存) 或用 cuBLAS grouped GEMM API (`cublasGemmGroupedBatchedEx`, 不同 A/B/C 指针数组)。cudarc 0.19.7 有 `safe/grouped_gemm.rs`。**中复杂度**: 需重写 grouped_gqa_prefill 的 GEMM 调用方式。
+
+**[中 ROI / 低复杂度] Conv stem GPU permute/PE — 预估省 0.05-0.15s**
+`gpu_audio_encoder.rs:251-284` 有 3 处 CPU roundtrip: (1) download conv3 输出 → CPU permute [b,c,f,t]→[b,t,c,f] → upload; (2) download conv_out → CPU 加 PE → upload; (3) download co_gpu → CPU pack valid tokens → upload。conv stem 总耗时占 audio 1.25s 的一小部分 (sub-profile 未细分, 但 mel 上传+3 conv GEMM+这些 roundtrip 估 0.2-0.3s)。permute 可写一个 4D transpose kernel (已有 `swap_dims_12_f16` 作参考, 但这个是 [b,c,f,t]→[b,t,c,f] 不是 swap_dims_12); PE 加法可用现有 `add_bias_inplace` 模式。**风险**: ROADMAP 已记录 "不要用自定义 kernel 做 copy (cudarc launch overhead 大)" — 但那是针对小 chunk copy, 这里的 permute 是 b*t*c*f ≈ 30×16×480×13 ≈ 3M 元素, launch overhead 占比小。**需实测验证**。
+
+**[低 ROI] MLP 融合 — 预估省 <0.1s**
+当前 mlp ~22ms/层 = gate-up GEMM + silu_mul kernel + down GEMM。已有 `silu_mul_split_f16` kernel (fused)。要进一步消除中间 [b*s, inter] 张量需把 silu 融进 down GEMM 的 epilogue — cuBLAS 不支持自定义 epilogue, 需手写 GEMM kernel, Pascal sm_61 上打不过 cuBLAS (ROADMAP 已验证)。**跳过**。
+
+**[不可行] FlashAttention 手写 kernel**
+ROADMAP 已记录: Pascal sm_61 上手写 FlashAttention v1 慢 29x, v2 慢 17x, 打不过 cuBLAS HGEMM。**不要重试**。
+
+### 推荐执行顺序
+1. **cuBLAS algo 搜索** (高 ROI 低运行时成本, 中风险需时间戳验证) — 先做
+2. **Grouped GQA 单次 GEMM** (高 ROI 中复杂度) — 次之
+3. **Conv stem GPU permute** (中 ROI 低复杂度需实测) — 最后
+
 
 ### 3. voxtrans 接入
 `D:\voxtrans` 的 `asr_align.rs` 需要约 3 行改动：
