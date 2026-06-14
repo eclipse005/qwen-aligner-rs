@@ -54,12 +54,15 @@ src/
 ├── backend.rs              — DeviceRequest + ResolvedBackend + resolve()
 ├── raw_tensor.rs           — RawTensor { data: Vec<u8>, shape, dtype }
 ├── weights.rs              — load_weights() 保留原始 bytes
-├── error.rs                — AlignerError (scaffolding, 未接入公开 API)
 ├── inference.rs            — Engine enum + PreparedInput 共享 pipeline
 ├── cudarc_engine.rs        — CUDA 引擎 + 28 层 text decoder + all op wrappers
 ├── gpu_audio_encoder.rs    — CUDA 24 层 audio encoder + conv stem
-├── cpu_engine.rs           — CPU 引擎: f16→f32 预转换权重 + f32 计算 (P0-1)
+├── cpu_engine.rs           — CPU 引擎 (text decoder 28 层 + audio encoder 24 层
+│                             + conv stem), f16→f32 预转换权重 + f32 计算 (P0-1).
+│                             双后端中 CPU 侧的完整实现, 不再是 stub.
+└── kernels/kernels.cu      — 手写 CUDA kernel (softmax/rmsnorm/rotary/attention)
 ```
+> 注: `error.rs` (`AlignerError`) 已删除 — 全 crate 实际都用 `anyhow::Result`。
 
 ## 已完成的工作
 
@@ -84,14 +87,17 @@ src/
 | `bb179f9` | docs: 标注 prefill_attention 4-row / 2-row / P4-2 尝试均 rejected |
 | `c5add06` | **CPU conv stem NHWC direct conv (P4-1)** — NCHW→NHWC 转置 + 1-row 8-col microkernel 取代 im2col + 1-row 8-col matmul。3x3 gather 内联进 FMA inner loop，省 389ms 标量 im2col (180s)。180s conv2 3050ms→1700ms, audio_encoder 9.2s→6.9-7.3s, total 27.1s→25.8s (1.05x). 15s 1.10s→1.03s. *4-row / 8-row P2-1 试过 (rejected) 后, P4-2 [f32; 8] / [__m256; 16] 寄存器累计也试过 (rejected - copy_from_slice 开销超过 L1 节省)* |
 | `441af06` | docs: 标注 P4-2 寄存器累计尝试失败, P4-1 L1 accs 是当前甜点 |
+| `（本会话）` | **CPU 清理 + 两处优化**: (1) 删除 dead code (~150 行: `linear_f16` 家族 / `conv_row_*` / `CpuWeightF16` 死方法 / `error.rs` / `CpuTensor::zeros` / `embed_lookup` / `argmax` / `in_channels`+`max_pos`+`c3_out` 死字段), 去掉全局 `#![allow(dead_code)]`, 编译器现在能捕捉新死代码; 修正 `cpu_engine.rs` 文件头注释 (旧版声称"audio encoder 未实现" — 实际已完整实现). (2) `CpuConvStem` perm + PE 注入循环并行化 (rayon over rows, f16 round-trip 顺序严格保留 → bit-exact). (3) `prefill_attention` per-head scratch (`q_qh` s×hd, `scores` s×cur_len) 改用 thread-local `Cell<Vec<f32>>` 复用, 消除 28 层 × nqh head = 448 次/forward 的 alloc/free. 15s ~1.0s, 180s median ~25.7s. **40/40 exact (15s vs smoke) + 909/909 exact (180s vs 本会话捕获的 golden) 验证通过. CUDA 路径未触碰, default build 仍编译.** |
+| `（本会话 2）` | **`prefill_attention` causal work-skip (bit-exact)**: Q@K 内层从 `for t in 0..cur_len { if t>=limit { -inf } else { dot } }` 改成"整行填 -inf + 仅 `for t in 0..limit` 算 dot"; A@V 内层从 `0..cur_len + if w==0 continue` 改成 causal 分支只扫 `0..limit`。softmax 一字不改 (单遍 max + 左到右 sum + 归一化顺序严格保留) → 40/40 EN + 909/909 golden bit-exact. 180s median 25.7s→**24.43s** (~5% win), 15s ~0.96s. attn/层 548ms→480ms median. **GQA K/V 共享尝试 rejected (实测回归 25.7s→29.0s)**: par over `b*nkvh=8` 共享 K/V 给 n_rep=2 sibling heads, 理论省 K/V 流量; 实测回归 13%, 原因 (a) 20 核机器上 16-way→8-way 并行宽度减半, (b) 单 KV head=2.7MB 已全在 LLC (~36MB), 第二 sibling 的 K 读本就是 LLC hit, 共享理论不成立. 见 prefill_attention 注释里的"为何不用 GQA-share / 在线 softmax"段。bit-exact 红线: CPU 路径 attn_out→argmax 全程 f32 无 f16 吸收 (见 inference::argmax_rows 1/256 tie band), 在线/分块 softmax 改 sum 顺序会引入 ULPs 翻 JA 零时长 token argmax, 故不可用。 |
+| `（本会话 3）` | **`prefill_attention` live-region softmax (bit-exact)**: Q@K 不再写 `-inf` 到 masked tail (保持 resize 的 0.0); softmax + A@V 三遍都只扫 `[0..limit)` 而非全 `cur_len`。bit-exact 论证: masked tail 从不影响结果 (max 用 `>` 忽略 -inf/0; 旧代码 exp(-inf-mx)=0 对 sum 无贡献, 新代码根本不读 tail; A@V `w=0` 跳过等价于 tail 不进循环)。causal 平均填充 ~50% → scores 写/读流量减半。180s median 24.43s→**~23.8s** (系统噪声 ±0.7s), attn/层 480→~445ms, 15s ~0.94s. **t-outer Q@K (K-reuse across rows) rejected**: 改 `for t { for i { dot } }` 让 K[t] 只读一次喂所有 Q 行, 理论省 K 流量 2500×; 实测回归 ~17% (attn 445→534ms/层), 原因同 4-row microkernel — strided scores writes (stride=cur_len=5240 f32=20KB) 破坏 L1 prefetcher, 写散布的代价超过 K-reuse 收益。**audio `softmax_scaled` non-causal fast path (bit-exact, kept)**: 非 causal 分支去掉 dead `else {0.0}` 和 `row[j]*scale` 重复计算, scale 一次写进 out 复用。**`apply_rotary_row` 去掉 per-call `vec![d]` alloc**: 改成 pairwise locals (a,b → 旋转 → 写回), 3.5M allocs/forward 归零, 数学逐位等价 (同序 fmul/fsub/fadd)。40/40 + 909/909 bit-exact 全程保持, CUDA 未触碰。 |
 </input>
 ### 1. CPU 性能优化（**进行中** — 越快越好，无预设上限）
 
-当前瓶颈（180s EN 推理 ~25.8s median of 10，commit `441af06`）：
+当前瓶颈（180s EN 推理 ~24.4s median，本会话 2 后）：
 
 | 组件 | 耗时 | 占比 | 备注 |
-| text_decoder | **~17.6s** | **~68%** | 28 层 prefill；P1-2 v2 + 4 GEMM + RMSN/elementwise。attn inner ~480-510ms/层（K reads 主导） |
-| audio_encoder | **~7.0s** | **~27%** | P4-1 NHWC direct conv 后 conv_stem ~2.4-2.5s (conv2 1.7-1.8s 仍主导) + 24 音频层 (attn 1.7s + ffn 0.9s) + conv_out+PE ~0.07s |
+| text_decoder | **~17.9s** | **~73%** | 28 层 prefill；causal work-skip 后 attn ~470ms/层（K reads 主导，单 KV head 2.7MB 全在 LLC）。qkv ~32ms + MLP(gu+dp) ~73ms/层 |
+| audio_encoder | **~6.6s** | **~27%** | P4-1 NHWC direct conv 后 conv_stem ~2.4s (conv2 1.7s 仍主导) + 24 音频层 (attn 1.7s + ffn 0.9s) |
 | prepare_input | 0.2s | <1% | 已是噪声 |
 
 audio_encoder 7.0s 内部分解（commit `c5add06`）：

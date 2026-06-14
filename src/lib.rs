@@ -15,7 +15,6 @@ pub mod batch;
 pub(crate) mod raw_tensor;
 mod weights;
 pub mod backend;
-mod error;
 
 // The CUDA engine modules.
 #[cfg(feature = "cuda")]

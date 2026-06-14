@@ -1,27 +1,22 @@
-//! CPU-resident text decoder for the Qwen3-ForcedAligner.
+//! CPU-resident engine for the Qwen3-ForcedAligner (text decoder + audio encoder).
 //!
-//! Mirror of `cudarc_engine.rs` running on the host CPU:
+//! Mirror of `cudarc_engine.rs` / `gpu_audio_encoder.rs` running on the host CPU:
 //!   * `gemm` crate handles every matmul, with `Parallelism::Rayon(0)` forced
 //!     even for the m=1 lm_head GEMV (gemm's internal threshold would
 //!     otherwise leave decode single-threaded).
 //!   * `rayon` parallelises every hand-written elementwise / reduction op
 //!     (rms_norm, silu_mul, prefill attention) across heads or rows.
-//!   * Tensors are f32 (Vec<f32>) — modern x86 has no native f16 SIMD outside
-//!     Sapphire Rapids, so f32 ends up faster than f16 with upcast.
+//!   * Tensors are f32 (Vec<f32>) — Arrow Lake / Zen-class x86 has no native
+//!     f16 SIMD outside Sapphire Rapids, so f32 ends up faster than f16 with
+//!     upcast. All weights are pre-converted f16→f32 once at load time.
 //!   * KV cache is pre-allocated per layer.
+//!   * The two hot attention inner loops (Q@K dot and A@V axpy) are written as
+//!     AVX2+FMA intrinsics (`dot_qk_avx2` / `axpy_avx2`), and the conv stem
+//!     uses a 1-row × 8-col NHWC direct-conv microkernel (`conv_nhwc_direct`).
 //!
-//! Audio encoder on CPU is **not yet implemented**; `DeviceRequest::Cpu`
-//! currently fails fast at `run_audio_encoder` with a clear "use CUDA for
-//! now" message.  The decoder (this file's main body) is the part that's
-//! 80% of the runtime for the aligner and is what the CPU path actually
-//! exercises.  See the project's handoff.md for the planned audio encoder
-//! port.
-
-// `#[allow(dead_code)]` is attached to items that are part of the audio
-// encoder CPU port stub (mirroring cudarc_engine.rs's signature, but with
-// the body returning an error).  These will be exercised once the audio
-// encoder lands.
-#![allow(dead_code)]
+//! Both the 28-layer text decoder and the 24-layer audio encoder (conv stem +
+//! transformer) are fully implemented here; `DeviceRequest::Cpu` runs the
+//! whole pipeline end-to-end with no CUDA dependency.
 
 use anyhow::Result;
 use gemm::{gemm, Parallelism};
@@ -67,10 +62,6 @@ impl CpuTensor {
         assert_eq!(data.len(), expected, "CpuTensor len mismatch (shape {:?})", shape);
         Self { data, shape }
     }
-    pub fn zeros(shape: Vec<usize>) -> Self {
-        let n: usize = shape.iter().product();
-        Self { data: vec![0.0; n], shape }
-    }
     pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn numel(&self) -> usize { self.data.len() }
     pub fn reshape(mut self, shape: Vec<usize>) -> Self {
@@ -95,29 +86,11 @@ pub(crate) struct CpuWeightF16 {
 }
 
 impl CpuWeightF16 {
-    /// Sequential f16→f32. Better for many small calls (audio encoder: ~100/forward).
-    pub(crate) fn to_f32(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
-        CpuWeight { data, rows: self.rows, cols: self.cols }
-    }
-
-    /// Rayon f16→f32. Better for few large calls (text decoder prefill).
-    fn to_f32_weight(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
-        CpuWeight { data, rows: self.rows, cols: self.cols }
-    }
-
-    /// Consuming f16→f32 with rayon. Use at load time to hoist conversion out
+    /// Consuming f16→f32 with rayon. Used at load time to hoist conversion out
     /// of the hot loop. The 0.6B model costs ~1.2 GB extra RAM, but eliminates
     /// repeated per-call conversions (text decoder: ~250 calls per forward).
     pub(crate) fn into_f32(self) -> CpuWeight {
         let data: Vec<f32> = self.data.into_par_iter().map(|v| v.to_f32()).collect();
-        CpuWeight { data, rows: self.rows, cols: self.cols }
-    }
-
-    /// Borrowing f16→f32 with rayon (for cases where we still need the f16).
-    pub(crate) fn to_f32_par(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
         CpuWeight { data, rows: self.rows, cols: self.cols }
     }
 }
@@ -197,66 +170,6 @@ fn linear_gemv(x: &[f32], w: &CpuWeight) -> Vec<f32> {
             let w_row = &w.data[row * k..(row + 1) * k];
             let mut acc = 0.0f32;
             for j in 0..k { acc += x[j] * w_row[j]; }
-            *o = acc;
-        }
-    });
-    out
-}
-
-// ─── f16-weight variants (decode: direct f16 read; prefill: convert to f32) ────
-
-/// `linear()` for f16 weights. Decode (m=1) reads f16 directly; prefill converts to f32.
-fn linear_f16(x: &CpuTensor, w: &CpuWeightF16) -> CpuTensor {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    assert_eq!(k, w.cols, "linear_f16 K mismatch: x last={} vs W cols={}", k, w.cols);
-    let mut out_shape = x.shape.clone();
-    out_shape[nd - 1] = n;
-    if m == 1 {
-        let out = linear_gemv_f16(&x.data, w);
-        return CpuTensor::new(out, out_shape);
-    }
-    let w_f32 = w.to_f32_weight();
-    let mut out = vec![0.0f32; m * n];
-    gemm_row_major(&mut out, &x.data, &w_f32, m, 0.0);
-    CpuTensor::new(out, out_shape)
-}
-
-/// `linear_accum()` for f16 weights.
-fn linear_accum_f16(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeightF16) {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    assert_eq!(k, w.cols);
-    assert_eq!(out.numel(), m * n);
-    if m == 1 {
-        let add = linear_gemv_f16(&x.data, w);
-        for (o, a) in out.data.iter_mut().zip(add.iter()) { *o += *a; }
-        return;
-    }
-    let w_f32 = w.to_f32_weight();
-    gemm_row_major(&mut out.data, &x.data, &w_f32, m, 1.0);
-}
-
-/// Same as `linear_gemv` but reads f16 weights directly — halved memory bandwidth.
-fn linear_gemv_f16(x: &[f32], w: &CpuWeightF16) -> Vec<f32> {
-    let n = w.rows;
-    let k = w.cols;
-    debug_assert_eq!(x.len(), k);
-    let mut out = vec![0.0f32; n];
-    let chunk = (n / (rayon::current_num_threads() * 4)).max(64).min(2048);
-    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, slab)| {
-        let row0 = ci * chunk;
-        for (offset, o) in slab.iter_mut().enumerate() {
-            let row = row0 + offset;
-            let w_row = &w.data[row * k..(row + 1) * k];
-            let mut acc = 0.0f32;
-            for j in 0..k {
-                acc += x[j] * w_row[j].to_f32();
-            }
             *o = acc;
         }
     });
@@ -351,37 +264,6 @@ pub(crate) fn add_inplace(a: &mut CpuTensor, b: &CpuTensor) {
         .for_each(|(x, y)| *x += *y);
 }
 
-pub(crate) fn embed_lookup(table: &CpuWeight, ids: &[i64]) -> CpuTensor {
-    let n = ids.len();
-    let d = table.cols;
-    let mut out = vec![0.0f32; n * d];
-    out.par_chunks_mut(d)
-        .zip(ids.par_iter())
-        .for_each(|(o, &id)| {
-            let src = &table.data[(id as usize) * d..(id as usize + 1) * d];
-            o.copy_from_slice(src);
-        });
-    CpuTensor::new(out, vec![n, d])
-}
-
-pub(crate) fn argmax(x: &[f32]) -> i32 {
-    const CHUNK: usize = 4096;
-    let n = x.len();
-    let (idx, _) = (0..n).step_by(CHUNK).collect::<Vec<_>>()
-        .par_iter()
-        .map(|&start| {
-            let end = (start + CHUNK).min(n);
-            let mut best_idx = start;
-            let mut best_val = x[start];
-            for i in (start + 1)..end {
-                if x[i] > best_val { best_val = x[i]; best_idx = i; }
-            }
-            (best_idx, best_val)
-        })
-        .reduce(|| (0usize, f32::NEG_INFINITY), |a, b| if b.1 > a.1 { b } else { a });
-    idx as i32
-}
-
 /// Swap dims 1 and 2 of a 4D tensor: [d0, d1, d2, d3] → [d0, d2, d1, d3].
 pub(crate) fn swap_dims_12(x: &CpuTensor) -> CpuTensor {
     assert_eq!(x.shape.len(), 4);
@@ -462,11 +344,17 @@ pub(crate) fn matmul_av(attn: &CpuTensor, v: &CpuTensor) -> CpuTensor {
 fn apply_rotary_row(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     let d = x.len();
     let half = d / 2;
-    let mut tmp = vec![0.0f32; d];
-    tmp.copy_from_slice(x);
+    // Rotary is a pairwise rotation of (x[i], x[i+half]) using the *original*
+    // values of both.  Previously this hoisted a vec![d] copy per call; with
+    // (nqh+nkvh)=24 heads × b*s=5240 tokens × 28 layers = 3.5M allocs/forward
+    // that was pure waste.  Capture both into locals first, then write back —
+    // the fmul/fsub/fadd are the identical operations on the identical inputs
+    // in the identical order, so bit-exact.  No allocation.
     for i in 0..half {
-        x[i]        = tmp[i]        * cos[i]        - tmp[i + half] * sin[i];
-        x[i + half] = tmp[i + half] * cos[i + half] + tmp[i]        * sin[i + half];
+        let a = x[i];
+        let b = x[i + half];
+        x[i] = a * cos[i] - b * sin[i];
+        x[i + half] = b * cos[i + half] + a * sin[i + half];
     }
 }
 
@@ -538,6 +426,25 @@ pub(crate) fn qkv_extract_qkv_norm_rotary_cache(
 //  Prefill attention (s > 1, full causal mask, f32 throughout)
 // ═══════════════════════════════════════════════════════════════════════
 
+// Thread-local scratch buffers for `prefill_attention`.  The per-head work
+// previously allocated `q_qh` (s*hd) and `scores` (s*cur_len) on every one of
+// the 28 layers × nqh heads = 448 heads/forward.  With rayon's work-stealing,
+// each head runs on some worker thread; parking the scratch behind a
+// thread-local (Cell<Vec<f32>>) means each worker reuses one growing buffer
+// across all heads it processes, instead of alloc/free per head.  We take()
+// the Vec out of the cell, use it as an owned value for this head, then put it
+// back — so the body has a normal `&mut Vec<f32>` with no aliasing at all.
+thread_local! {
+    static PREFILL_Q: std::cell::Cell<Vec<f32>> = const { std::cell::Cell::new(Vec::new()) };
+    static PREFILL_SCORES: std::cell::Cell<Vec<f32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+/// Take the thread-local scratch Vec (or empty if first use on this thread),
+/// leaving an empty Vec in its place.  Caller MUST `set` it back when done.
+fn take_scratch(cell: &std::cell::Cell<Vec<f32>>) -> Vec<f32> {
+    cell.take()
+}
+
 fn prefill_attention(
     q: &CpuTensor,
     k_cache: &[f32], v_cache: &[f32],
@@ -548,49 +455,95 @@ fn prefill_attention(
     let n_rep = nqh / nkvh;
     let scale = 1.0f32 / (hd as f32).sqrt();
     let out = vec![0.0f32; b * s * nqh * hd];
+    // kv_start = number of cached positions before this prefill chunk.
+    // For the aligner's single-prefill use (kv_start=0) cur_len == s.
+    let kv_start = cur_len - s;
 
-    // P1-2 (v2): keep the per-head scalar outer loop (32-way parallel), but
-    // SIMD-ize the two hot inner loops with AVX2+FMA: the Q@K dot product
-    // (was the 87% of text_decoder on 180s) and the A@V weighted sum.
-    // The previous attempt to use the gemm crate failed because matrixmultiply
-    // is tuned for K>=256, and our K=128 was too small for the microkernel.
+    // ───────────────────────────────────────────────────────────────────
+    //  Causal work-skip rewrite.
+    //
+    //  P1-2 (v2): parallelise over (b * nqh) query heads (16-way on this
+    //  model — good width for a 20-core box; a prior attempt parallelised
+    //  over (b * nkvh = 8) KV heads to share K/V between GQA siblings, but
+    //  that *halved* the parallel width and regressed ~13% on a many-core
+    //  host.  Per-head K reads are already LLC-resident (one KV head = 2.7 MB
+    //  < ~36 MB LLC), so the second sibling's K read is an LLC hit anyway —
+    //  the GQA-share theory didn't pay off.  Keep 16-way.
+    //
+    //  The actual win here is causal work-skip: query row i only attends to
+    //  K/V[0..=i+kv_start].  The masked tail never enters the inner loop.
+    //  Each scores row is pre-filled with NEG_INFINITY (byte-identical to the
+    //  old code that wrote -inf into each masked slot), so softmax max/sum/exp
+    //  see the exact same row bytes → bit-exact.  A@V likewise iterates only
+    //  the live tail instead of scanning all cur_len with `if w==0 continue`.
+    //
+    //  BIT-EXACT CONTRACT: softmax reduction order (single-pass max, then
+    //  left-to-right sum, then normalize) is preserved verbatim.  Online /
+    //  block-wise softmax was rejected: it changes the sum reduction order,
+    //  and the CPU path has no f16 round-trip to absorb the resulting ULPs
+    //  before argmax (inference::argmax_rows, 1/256 tie band).  Each
+    //  dot_qk_avx2(qi, kt) is deterministic in its inputs, and every
+    //  scores[i][t] for t < limit is computed with the identical (qi, kt)
+    //  pair as the old per-head code → every softmax input is bit-identical.
+    // ───────────────────────────────────────────────────────────────────
     (0..b * nqh).into_par_iter().for_each(|idx| {
         let ib = idx / nqh;
         let qh = idx % nqh;
         let kh = qh / n_rep;
-        let k_base = (ib * nkvh + kh) * max_seq * hd;
-        let v_base = (ib * nkvh + kh) * max_seq * hd;
+        let kv_base = (ib * nkvh + kh) * max_seq * hd;
 
-        let mut q_qh = vec![0.0f32; s * hd];
+        // Borrow the thread-local scratch for this head: resize (no realloc if
+        // it already fits from a previous head on this worker), gather Q rows,
+        // run Q@K + softmax + A@V, then return the Vec to the thread-local.
+        let mut q_qh = PREFILL_Q.with(take_scratch);
+        q_qh.resize(s * hd, 0.0);
         for i in 0..s {
             let src = ((ib * s + i) * nqh + qh) * hd;
             q_qh[i * hd..(i + 1) * hd].copy_from_slice(&q.data[src..src + hd]);
         }
 
-        // Q @ K^T: per-head [s, hd] @ [hd, s] -> [s, s].  Causal mask in inner
-        // loop.  Inner dot product is 8-wide FMA.  Tried 4-row microkernel
-        // (dot4_qk_avx2) which saves K cache reads, but the 4 strided writes
-        // to scores (one per i in the block) thrash the L1 more than the
-        // K-read savings are worth; net 4-row is slower.  Keep 1-row.
-        let mut scores = vec![0.0f32; s * cur_len];
+        // Q @ K^T: per-head [s, hd] @ [hd, s] -> [s, s].  Inner dot product is
+        // 8-wide FMA.  i-outer: each Q row reads its live K rows; Q[i] stays
+        // L1-hot across the t loop, and scores writes are contiguous per row.
+        // (A t-outer variant was tested to share K[t] reads across Q rows but
+        // regressed ~17%: strided scores writes at stride=cur_len thrash the
+        // cache worse than the K-reuse saves.  Same lesson as the rejected
+        // 4-row microkernel.  Keep i-outer.)
+        // Causal work-skip: only [0..limit) per row is written; the masked tail
+        // [limit..cur_len] is left at 0.0 (resize) and never read again —
+        // softmax and A@V below both scan only [0..limit).  Bit-exact: the
+        // tail's value never influenced the result (see softmax note below).
+        let mut scores = PREFILL_SCORES.with(take_scratch);
+        scores.resize(s * cur_len, 0.0);
         for i in 0..s {
             let qi = &q_qh[i * hd..(i + 1) * hd];
-            let limit = if causal { i + (cur_len - s) + 1 } else { cur_len };
-            for t in 0..cur_len {
-                if t >= limit {
-                    scores[i * cur_len + t] = f32::NEG_INFINITY;
-                } else {
-                    let kt = &k_cache[k_base + t * hd..k_base + (t + 1) * hd];
-                    let dot = unsafe { dot_qk_avx2(qi, kt) };
-                    scores[i * cur_len + t] = dot * scale;
-                }
+            let limit = if causal { i + kv_start + 1 } else { cur_len };
+            let row = &mut scores[i * cur_len..i * cur_len + limit];
+            for t in 0..limit {
+                let kt = &k_cache[kv_base + t * hd..kv_base + (t + 1) * hd];
+                let dot = unsafe { dot_qk_avx2(qi, kt) };
+                row[t] = dot * scale;
             }
         }
-        // Softmax: scalar (the f32::exp call is the dominant cost and
-        // a polynomial SIMD exp would change bit-exactness; not worth it
-        // for the small ~5% gain on this 5% slice of the decoder).
+
+        // Softmax (single-pass max, left-to-right sum, normalize — order
+        // preserved verbatim for bit-exactness).  Causal: the live region of
+        // row i is [0..limit=i+kv_start+1]; the masked tail [limit..cur_len]
+        // was never written (still 0.0 from resize).  Scanning only [0..limit)
+        // is bit-exact because the tail never affected the result anyway:
+        //   max pass: -inf/0.0 < any real score (rows always have ≥1 live t).
+        //   exp/sum: a 0.0 tail element would give exp(0-mx) (nonzero!) which
+        //   WOULD corrupt the sum — so we must NOT leave 0.0 in the tail when
+        //   softmax could touch it.  Since we now scan only [0..limit), the
+        //   tail is never read, so its value is irrelevant.  But the OLD code
+        //   wrote -inf to the tail and scanned the full row; its exp(-inf-mx)=0
+        //   contributed nothing.  Restricting softmax to [0..limit) produces
+        //   identical mx, identical exp(x-mx) for live x, identical sum, and
+        //   identical normalized weights on the live region.  Tail bytes are
+        //   never consumed (A@V below also scans only [0..limit)).  Bit-exact.
         for i in 0..s {
-            let row = &mut scores[i * cur_len..(i + 1) * cur_len];
+            let limit = if causal { i + kv_start + 1 } else { cur_len };
+            let row = &mut scores[i * cur_len..i * cur_len + limit];
             let mut mx = f32::NEG_INFINITY;
             for &v in row.iter() { if v > mx { mx = v; } }
             let mut sum = 0.0f32;
@@ -598,26 +551,36 @@ fn prefill_attention(
             let inv = 1.0 / sum;
             for v in row.iter_mut() { *v *= inv; }
         }
-        // Scores @ V: kept at 1-row microkernel.  The 4-row version (axpy4_avx2)
-        // saves V cache reads but the 4 OUT[i, :] rows are stride-hd apart in
-        // the OUT tensor (each at its own head's [b, s, nqh, hd] position) and
-        // the L1 prefetcher handles the single-row sequential pattern much
-        // better than 4 strided rows.  Net: 1-row is faster here.
+
+        // Scores @ V: 1-row microkernel.  The 4-row version saves V cache
+        // reads but the 4 OUT[i,:] rows are stride-hd apart (each at its own
+        // head's [b,s,nqh,hd] slot) and the L1 prefetcher handles the single
+        // sequential row better.  Net: 1-row is faster.  Causal: only
+        // [0..limit) can be non-zero (the rest were -inf → softmax weight 0),
+        // so iterate the live tail only.
         let out_ptr = out.as_ptr() as *mut f32;
         for i in 0..s {
             let dst_off = ((ib * s + i) * nqh + qh) * hd;
+            let limit = if causal { i + kv_start + 1 } else { cur_len };
+            let scan = if causal { limit } else { cur_len };
             unsafe {
                 let out_i = std::slice::from_raw_parts_mut(out_ptr.add(dst_off), hd);
                 for j in 0..hd { out_i[j] = 0.0; }
                 let row = &scores[i * cur_len..(i + 1) * cur_len];
-                for t in 0..cur_len {
+                for t in 0..scan {
                     let w = row[t];
                     if w == 0.0 { continue; }
-                    let vt = &v_cache[v_base + t * hd..v_base + (t + 1) * hd];
+                    let vt = &v_cache[kv_base + t * hd..kv_base + (t + 1) * hd];
                     axpy_avx2(out_i, w, vt);
                 }
             }
         }
+
+        // Return the scratch buffers to their thread-locals for reuse by the
+        // next head on this worker.  `shrink_to_fit` would defeat the reuse,
+        // so we deliberately leave the capacity pinned high.
+        PREFILL_Q.with(|c| c.set(q_qh));
+        PREFILL_SCORES.with(|c| c.set(scores));
     });
 
     CpuTensor::new(out, vec![b, nqh, s, hd])
@@ -663,43 +626,6 @@ unsafe fn axpy_avx2(out: &mut [f32], w: f32, v: &[f32]) {
         let r = _mm256_fmadd_ps(wv, vv, vo);
         _mm256_storeu_ps(out.as_mut_ptr().add(j * 8), r);
     }
-}
-
-/// AVX2+FMA: for one output row of the conv stem matmul, accumulate
-/// 8 c_out outputs over `cols = c_in*9` inner-product terms.
-/// `w_t` is the *transposed* weight in [cols, c_out] row-major (transposed
-/// at load time so 8 c_out values at a fixed k are contiguous).
-/// Returns an __m256 of 8 c_out outputs for this row.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn conv_row_8cols(
-    row_in: *const f32,    // im2col[row, 0]
-    w_t: *const f32,       // W^T[0, 0] in [cols, c_out] layout
-    cols: usize,           // = c_in * 9
-    c_out: usize,          // total c_out count (stride for W^T)
-    c_out_base: usize,
-) -> std::arch::x86_64::__m256 {
-    use std::arch::x86_64::*;
-    let mut acc = _mm256_setzero_ps();
-    for k in 0..cols {
-        let w_vec = _mm256_loadu_ps(w_t.add(k * c_out + c_out_base));
-        let x_val = *row_in.add(k);
-        let x_vec = _mm256_set1_ps(x_val);
-        acc = _mm256_fmadd_ps(w_vec, x_vec, acc);
-    }
-    acc
-}
-
-/// Scalar tail for one c_out when c_out % 8 != 0.
-#[inline(always)]
-fn conv_row_tail_t(
-    im2col: &[f32], w_t: &[f32], row: usize, cols: usize, c_out: usize, c_out_idx: usize,
-) -> f32 {
-    let mut acc = 0.0f32;
-    for k in 0..cols {
-        acc += w_t[k * c_out + c_out_idx] * im2col[row * cols + k];
-    }
-    acc
 }
 
 /// P4-1: NHWC direct 3x3 conv kernel — 1-row x 8-col microkernel.
@@ -775,7 +701,6 @@ struct CpuConv2d {
     /// Weight stored as f32 (pre-converted at load time).
     weight: CpuWeight,   // [c_out, c_in*9] (im2col-friendly layout)
     bias: Option<Vec<f32>>,
-    in_channels: usize,
     out_channels: usize,
 }
 
@@ -807,7 +732,7 @@ impl CpuConv2d {
             }
         }
         let weight = CpuWeight { data: w_t, rows: cols, cols: c_out };
-        Ok(Self { weight, bias, in_channels: c_in, out_channels: c_out })
+        Ok(Self { weight, bias, out_channels: c_out })
     }
 
     /// x: [b, c_in, f, t] NCHW  →  out: [b, c_out, f_out, t_out]
@@ -964,9 +889,7 @@ struct CpuConvStem {
     conv_out: CpuLinear,
     pe: Vec<f32>,    // [max_pos, d_model]
     d_model: usize,
-    max_pos: usize,
     n_mels_out: usize,
-    c3_out: usize,
 }
 
 impl CpuConvStem {
@@ -980,7 +903,6 @@ impl CpuConvStem {
         // Conv stem downsamples 3x by stride=2 → n_mels_out = f(f(f(n_mels)))
         let f = |l: usize| -> usize { l / 2 };
         let n_mels_out = f(f(f(config.num_mel_bins)));
-        let c3_out = conv3.out_channels;
         // Sinusoidal PE (matches asr-burn's CPU encoder, identical math to the CUDA path).
         let half = dm / 2;
         let lt = (10000.0f64).ln() / (half as f64 - 1.0).max(1.0);
@@ -994,7 +916,7 @@ impl CpuConvStem {
         }
         Ok(Self {
             conv1, conv2, conv3, conv_out, pe: pe_f32,
-            d_model: dm, max_pos, n_mels_out, c3_out,
+            d_model: dm, n_mels_out,
         })
     }
 
@@ -1019,20 +941,20 @@ impl CpuConvStem {
         let xs = x.shape();
         let (b, c, fo, t2) = (xs[0], xs[1], xs[2], xs[3]);
         assert_eq!(fo, self.n_mels_out, "conv stem spatial out mismatch: got {}, expected {}", fo, self.n_mels_out);
-        // Pack [b, t2, c*f2] in row-major.
+        // Pack [b, t2, c*f2] in row-major. Parallel over (ib, it) rows — each
+        // job writes a disjoint c*fo row into `perm`, so no cross-job aliasing.
         let mut perm = vec![0.0f32; b * t2 * c * fo];
-        for ib in 0..b {
-            for it in 0..t2 {
-                for ic in 0..c {
-                    for f in 0..fo {
-                        // src is [b, c, f, t] = ((ib * c + ic) * f + f) * t2 + it
-                        let src = ((ib * c + ic) * fo + f) * t2 + it;
-                        let dst = ((ib * t2 + it) * c + ic) * fo + f;
-                        perm[dst] = x.data[src];
-                    }
+        perm.par_chunks_mut(c * fo).enumerate().for_each(|(row, row_out)| {
+            let ib = row / t2;
+            let it = row % t2;
+            for ic in 0..c {
+                for f in 0..fo {
+                    // src is [b, c, f, t] = ((ib * c + ic) * fo + f) * t2 + it
+                    let src = ((ib * c + ic) * fo + f) * t2 + it;
+                    row_out[ic * fo + f] = x.data[src];
                 }
             }
-        }
+        });
         let dt_perm = sub_ms(t0);
         // conv_out linear: W is [d_model, c*f2].  out = perm @ W^T.
         // The conv_out weight's second dim is c3 * n_mels_out (per the standard fixed
@@ -1052,19 +974,20 @@ impl CpuConvStem {
         let dt_conv_out = sub_ms(t0);
         // co: [b*t2, d_model].  Add PE row it (broadcast over b).
         // Match candle's f16_add: quantise both operands and the result through f16.
+        // Parallel over rows — each (ib, it) row is d_model contiguous and disjoint.
+        // The f16::from_f32/round-trip order is preserved exactly (bit-exact).
         let t0 = sub_t0();
         let mut out = co.data.clone();
-        for ib in 0..b {
-            for it in 0..t2 {
-                let base = (ib * t2 + it) * self.d_model;
-                let pe_base = it * self.d_model;
-                for j in 0..self.d_model {
-                    let a = f16::from_f32(out[base + j]).to_f32();
-                    let b = f16::from_f32(self.pe[pe_base + j]).to_f32();
-                    out[base + j] = f16::from_f32(a + b).to_f32();
-                }
+        let dm = self.d_model;
+        out.par_chunks_mut(dm).enumerate().for_each(|(row, row_out)| {
+            let it = row % t2;
+            let pe_base = it * dm;
+            for j in 0..dm {
+                let a = f16::from_f32(row_out[j]).to_f32();
+                let b = f16::from_f32(self.pe[pe_base + j]).to_f32();
+                row_out[j] = f16::from_f32(a + b).to_f32();
             }
-        }
+        });
         let dt_pe = sub_ms(t0);
         if sub_profile_enabled() {
             eprintln!("  conv_stem dt: conv1={:.1} conv2={:.1} conv3={:.1} perm={:.1} conv_out={:.1} pe={:.1} ms (total {:.1})",
@@ -1138,13 +1061,39 @@ impl CpuAudioAttention {
 /// Scaled softmax over the last two dims of a 4D [b, nh, s, t] tensor.
 /// If causal=true, row i masks out columns > i.
 /// out[i, j] = exp(in[i, j]*scale - max) / sum;  0 for j > i (if causal).
+///
+/// Non-causal path (the audio encoder's only call site, causal=false): the
+/// `valid_t == t` always, so the masked branch is dead.  This fast path scales
+/// each score once into `out` (reused as the exp scratch), finds the row max,
+/// then does the in-place exp + left-to-right sum + normalize — bit-identical
+/// to the general path because every fmul/fsub/fexp sees the same inputs in
+/// the same order; we just don't recompute `row[j]*scale` twice and skip the
+/// dead `else` branch.
 fn softmax_scaled(scores: &CpuTensor, scale: f32, causal: bool) -> CpuTensor {
     let s = scores.shape();
     let (b, nh, sl, t) = (s[0], s[1], s[2], s[3]);
     let mut out = vec![0.0f32; b * nh * sl * t];
+    if !causal {
+        // Non-causal fast path: scale once into out, single max pass, single
+        // exp+sum pass, single normalize pass.
+        out.par_chunks_mut(t).enumerate().for_each(|(idx, slab)| {
+            let row = &scores.data[idx * t..(idx + 1) * t];
+            // Scale into slab (this is `row[j]*scale`, computed once not twice).
+            for j in 0..t { slab[j] = row[j] * scale; }
+            let mut max_v = f32::NEG_INFINITY;
+            for &v in slab.iter() { if v > max_v { max_v = v; } }
+            let mut sum = 0.0f32;
+            for v in slab.iter_mut() { *v = (*v - max_v).exp(); sum += *v; }
+            let inv = 1.0 / sum;
+            for v in slab.iter_mut() { *v *= inv; }
+        });
+        return CpuTensor::new(out, vec![b, nh, sl, t]);
+    }
+    // General causal path (unchanged for bit-exactness on any future causal
+    // caller; currently only the non-causal fast path above is exercised).
     out.par_chunks_mut(t).enumerate().for_each(|(idx, slab)| {
         let i = idx % sl;
-        let valid_t = if causal { i + 1 } else { t };
+        let valid_t = i + 1;
         let row = &scores.data[idx * t..(idx + 1) * t];
         let mut max_v = f32::NEG_INFINITY;
         for j in 0..valid_t {
