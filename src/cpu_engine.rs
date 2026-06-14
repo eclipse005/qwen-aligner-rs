@@ -58,6 +58,17 @@ fn flash_enabled() -> bool {
     *FLASH.get_or_init(|| std::env::var_os("QFA_NO_FLASH").is_none())
 }
 
+// Same idea applied to the AUDIO encoder's full (non-causal) self-attention.
+// The audio path materialises a [1,nh,s,s] scores tensor (350 MB at s=2340) and
+// a second 350 MB softmax output — both killed by tiling.  Independent flag so
+// audio/text flash can be toggled separately.  Default on; QFA_NO_AUDIO_FLASH=1
+// falls back to matmul_qk + softmax_scaled + matmul_av.
+static AUDIO_FLASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn audio_flash_enabled() -> bool {
+    *AUDIO_FLASH.get_or_init(|| std::env::var_os("QFA_NO_AUDIO_FLASH").is_none())
+}
+
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Host-side f32 tensors
@@ -349,7 +360,125 @@ pub(crate) fn matmul_av(attn: &CpuTensor, v: &CpuTensor) -> CpuTensor {
     });
     CpuTensor::new(out, vec![b, nh, s, hd])
 }
-//  Rotary embedding (in-place on a head row)
+
+// ═══════════════════════════════════════════════════════════════════════
+//  FlashAttention-style tiled attention for the AUDIO encoder.
+//
+//  Replaces matmul_qk + softmax_scaled(causal=false) + matmul_av for the
+//  [1, nh, s, hd] Q/K/V layout.  Audio is full (non-causal): every Q row
+//  attends to all K/V rows.  The materialised path allocated two [1,nh,s,s]
+//  buffers (350 MB each at s=2340) and scanned them 3x; this tiled version
+//  keeps a [Bq, Bk] score tile in L1 and never materialises either buffer.
+//
+//  Same online-softmax algorithm as the text flash; hd here is 64 (vs 128 for
+//  text), so q_tile/o_state sized by hd, not a hardcoded 128.  b is always 1
+//  for the audio path.
+//
+//  Output: [1, nh, s, hd] (head-major), same as matmul_av, so the caller's
+//  swap_dims_12 + reshape to [1, s, dm] is unchanged.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+fn audio_attention_flash(
+    q: &CpuTensor, k: &CpuTensor, v: &CpuTensor,
+    nh: usize, s: usize, hd: usize, scale: f32,
+) -> CpuTensor {
+    const BQ: usize = 32;
+    const BK: usize = 128;
+    let out = vec![0.0f32; nh * s * hd];
+
+    (0..nh).into_par_iter().for_each(|ih| {
+        let h_off = ih * s * hd;
+        let qh = &q.data[h_off..h_off + s * hd];
+        let kh = &k.data[h_off..h_off + s * hd];
+        let vh = &v.data[h_off..h_off + s * hd];
+
+        let mut m_state = [f32::NEG_INFINITY; BQ];
+        let mut s_state = [0.0f32; BQ];
+        let mut o_state = vec![0.0f32; BQ * hd];
+        let mut s_tile = vec![0.0f32; BQ * BK];
+        let mut q_tile = vec![0.0f32; BQ * hd];
+
+        for q_start in (0..s).step_by(BQ) {
+            let q_end = (q_start + BQ).min(s);
+            let bq = q_end - q_start;
+
+            for r in 0..bq {
+                m_state[r] = f32::NEG_INFINITY;
+                s_state[r] = 0.0;
+                let qsrc = (q_start + r) * hd;
+                q_tile[r * hd..(r + 1) * hd].copy_from_slice(&qh[qsrc..qsrc + hd]);
+                for j in 0..hd { o_state[r * hd + j] = 0.0; }
+            }
+
+            // Non-causal: every Q row attends to all K/V[0..s).
+            for k_start in (0..s).step_by(BK) {
+                let k_end = (k_start + BK).min(s);
+                let bk = k_end - k_start;
+
+                // S[r, c] = (Q[q_start+r] · K[k_start+c]) * scale
+                for r in 0..bq {
+                    let qi = &q_tile[r * hd..(r + 1) * hd];
+                    let srow = &mut s_tile[r * BK..r * BK + bk];
+                    for c in 0..bk {
+                        let t = k_start + c;
+                        let kt = &kh[t * hd..(t + 1) * hd];
+                        srow[c] = unsafe { dot_qk_avx2(qi, kt) } * scale;
+                    }
+                }
+
+                for r in 0..bq {
+                    let srow = &s_tile[r * BK..r * BK + bk];
+                    let mut m_new = m_state[r];
+                    for &v in srow.iter() { if v > m_new { m_new = v; } }
+                    let renorm = (m_state[r] - m_new).exp();
+                    let mut block_sum = 0.0f32;
+                    let mut exp_vals = [0.0f32; BK];
+                    for c in 0..bk {
+                        exp_vals[c] = (srow[c] - m_new).exp();
+                        block_sum += exp_vals[c];
+                    }
+                    s_state[r] = s_state[r] * renorm + block_sum;
+                    let orow = &mut o_state[r * hd..(r + 1) * hd];
+                    for j in 0..hd { orow[j] *= renorm; }
+                    for c in 0..bk {
+                        let w = exp_vals[c];
+                        if w == 0.0 { continue; }
+                        let t = k_start + c;
+                        let vt = &vh[t * hd..(t + 1) * hd];
+                        unsafe { axpy_avx2(orow, w, vt); }
+                    }
+                    m_state[r] = m_new;
+                }
+            }
+
+            // Final normalise + write out.
+            let out_ptr = out.as_ptr() as *mut f32;
+            for r in 0..bq {
+                let qr = q_start + r;
+                let dst_off = (ih * s + qr) * hd;
+                let inv = 1.0 / s_state[r];
+                unsafe {
+                    let out_i = std::slice::from_raw_parts_mut(out_ptr.add(dst_off), hd);
+                    let orow = &o_state[r * hd..(r + 1) * hd];
+                    for j in 0..hd { out_i[j] = orow[j] * inv; }
+                }
+            }
+        }
+    });
+
+    CpuTensor::new(out, vec![1, nh, s, hd])
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn audio_attention_flash(
+    _q: &CpuTensor, _k: &CpuTensor, _v: &CpuTensor,
+    _nh: usize, _s: usize, _hd: usize, _scale: f32,
+) -> CpuTensor {
+    unimplemented!("audio_attention_flash requires x86_64 AVX2")
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════
 
 #[inline]
@@ -1220,9 +1349,20 @@ impl CpuAudioAttention {
 
         let scale = 1.0f32 / (hd as f32).sqrt();
         let t = sub_t0();
-        let scores = matmul_qk(&q, &k);  // [1, nh, s, s]
-        let attn = softmax_scaled(&scores, scale, false);  // full (non-causal) attention for audio encoder
-        let attn_out = matmul_av(&attn, &v);  // [1, nh, s, hd]
+        let attn_out = if audio_flash_enabled() {
+            #[cfg(target_arch = "x86_64")]
+            { audio_attention_flash(&q, &k, &v, nh, s, hd, scale) }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let scores = matmul_qk(&q, &k);
+                let attn = softmax_scaled(&scores, scale, false);
+                matmul_av(&attn, &v)
+            }
+        } else {
+            let scores = matmul_qk(&q, &k);  // [1, nh, s, s]
+            let attn = softmax_scaled(&scores, scale, false);  // full (non-causal) attention for audio encoder
+            matmul_av(&attn, &v)  // [1, nh, s, hd]
+        };
         let dt_attn = sub_ms(t);
         let t = sub_t0();
         let attn_flat = swap_dims_12(&attn_out).reshape(vec![1, s, dm]);
