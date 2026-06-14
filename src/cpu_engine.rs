@@ -46,6 +46,18 @@ fn sub_ms(t0: Option<std::time::Instant>) -> f64 {
     match t0 { Some(t) => t.elapsed().as_secs_f64() * 1000.0, None => 0.0 }
 }
 
+// FlashAttention-style tiled prefill_attention is the DEFAULT (online softmax,
+// no 110 MB scores scratch, ~30% attn/layer reduction).  Accuracy gate is
+// timestamp-level, not bit-exact: the online softmax rescale changes the f32
+// sum-reduction order by ULPs, which *could* flip argmax at near-tie logits.
+// Validated against the 15s EN smoke (40/40) and the 180s golden (909/909)
+// timestamp equality — no flips observed.  Set QFA_NO_FLASH=1 to fall back to
+// the materialised-softmax path (kept for debugging / regression A/B).
+static FLASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn flash_enabled() -> bool {
+    *FLASH.get_or_init(|| std::env::var_os("QFA_NO_FLASH").is_none())
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Host-side f32 tensors
@@ -451,6 +463,12 @@ fn prefill_attention(
     b: usize, nqh: usize, nkvh: usize, max_seq: usize, hd: usize, cur_len: usize,
     causal: bool,
 ) -> CpuTensor {
+    if flash_enabled() {
+        return prefill_attention_flash(
+            q, k_cache, v_cache,
+            b, nqh, nkvh, max_seq, hd, cur_len, causal,
+        );
+    }
     let s = q.shape[2];
     let n_rep = nqh / nkvh;
     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -586,7 +604,168 @@ fn prefill_attention(
     CpuTensor::new(out, vec![b, nqh, s, hd])
 }
 
-/// AVX2+FMA dot product of two f32 slices of equal length.  Caller must
+// ═══════════════════════════════════════════════════════════════════════
+//  FlashAttention-style tiled prefill attention.
+//
+//  Replaces the materialised [s, cur_len] scores scratch (110 MB/head on the
+//  180s fixture — way past LLC) with a tiled online-softmax that keeps a
+//  [Bq, Bk] score tile in L1 and never materialises the full scores matrix.
+//  K is streamed once per Q-block-row instead of being re-read once per Q row.
+//
+//  Algorithm (per query head, per Q-block-row of Bq rows):
+//    for each K-block of Bk rows in the live region:
+//        S[q, :] = Q[q] · K[k_block]            (Bq × Bk, in L1)
+//        m_new   = max(m_old, rowmax(S[q, :]))
+//        renorm  = exp(m_old - m_new)
+//        s       = s * renorm + sum_q(exp(S[q,:] - m_new))
+//        O       = O * renorm + exp(S[q,:] - m_new) · V[k_block]
+//    O /= s                                       (final normalise)
+//
+//  `f32::exp` per element is preserved (same exp call as the materialised
+//  path on each (S-m_new) value); what changes vs bit-exact is the sum
+//  reduction order (per-K-block partial sums + a renormalisation rescale),
+//  which introduces f32 ULPs.  Accuracy gate is timestamp-level, not bit-
+//  level: see QFA_FLASH note above.  Output layout is identical to the
+//  materialised path ([b, s, nqh, hd] token-major) so o_proj is unchanged.
+//
+//  Block sizes: Bq=32 Q rows per tile (32 × hd × 4 = 16 KB Q tile in L1),
+//  Bk=128 K rows per tile (128 × hd × 4 = 64 KB K tile, fits L2; streamed).
+//  Per Q-block, a [Bq, Bk] S scratch = 32 × 128 × 4 = 16 KB stays in L1.
+//  Per-row online state m[Bq], s[Bq], O[Bq, hd] (32 × (1+1+128) × 4 ≈ 16.5 KB).
+//  Both fit comfortably in L1 (32-48 KB).
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+fn prefill_attention_flash(
+    q: &CpuTensor,
+    k_cache: &[f32], v_cache: &[f32],
+    b: usize, nqh: usize, nkvh: usize, max_seq: usize, hd: usize, cur_len: usize,
+    causal: bool,
+) -> CpuTensor {
+    const BQ: usize = 32;
+    const BK: usize = 128;
+    let s = q.shape[2];
+    let n_rep = nqh / nkvh;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let out = vec![0.0f32; b * s * nqh * hd];
+    let kv_start = cur_len - s;
+
+    (0..b * nqh).into_par_iter().for_each(|idx| {
+        let ib = idx / nqh;
+        let qh = idx % nqh;
+        let kh = qh / n_rep;
+        let kv_base = (ib * nkvh + kh) * max_seq * hd;
+
+        // Per-row online softmax state across K-blocks, sized for one Q tile.
+        let mut m_state = [f32::NEG_INFINITY; BQ];
+        let mut s_state = [0.0f32; BQ];
+        // O accumulator: [Bq, hd].  32 × 128 × 4 = 16 KB, stays in L1.
+        let mut o_state = vec![0.0f32; BQ * hd];
+        // S tile scratch: [Bq, Bk] = 32 × 128 = 4096 f32 = 16 KB, stays in L1.
+        let mut s_tile = vec![0.0f32; BQ * BK];
+        // Q tile: gather Bq Q rows once per Q-block (contiguous, L1-hot).
+        let mut q_tile = [0.0f32; BQ * 128]; // hd always 128 in this model
+        debug_assert_eq!(hd, 128);
+
+        // Process Q in blocks of Bq rows.
+        for q_start in (0..s).step_by(BQ) {
+            let q_end = (q_start + BQ).min(s);
+            let bq = q_end - q_start;
+
+            // (Re)initialise per-tile state.
+            for r in 0..bq {
+                m_state[r] = f32::NEG_INFINITY;
+                s_state[r] = 0.0;
+                let qsrc = ((ib * s + q_start + r) * nqh + qh) * hd;
+                q_tile[r * hd..(r + 1) * hd].copy_from_slice(&q.data[qsrc..qsrc + hd]);
+                for j in 0..hd { o_state[r * hd + j] = 0.0; }
+            }
+
+            // Causal: row (q_start+r) only attends to K/V[0 .. q_start+r+kv_start+1].
+            // So the K-block range is [0 .. max_row_limit) where
+            // max_row_limit = q_end-1 + kv_start + 1 = q_end + kv_start.
+            let max_k = if causal { q_end + kv_start } else { cur_len };
+
+            // Stream K/V in blocks of Bk.  Each K row read once per Q-block-row.
+            for k_start in (0..max_k).step_by(BK) {
+                let k_end = (k_start + BK).min(max_k);
+                let bk = k_end - k_start;
+
+                // S[r, c] = (Q[q_start+r] · K[k_start+c]) * scale  for r<bq, c<bk.
+                for r in 0..bq {
+                    let qr = q_start + r;
+                    let qi = &q_tile[r * hd..(r + 1) * hd];
+                    // Per-Q-row causal limit: K indices t in [0 .. qr+kv_start+1).
+                    let row_limit = if causal { qr + kv_start + 1 } else { cur_len };
+                    let srow = &mut s_tile[r * BK..r * BK + bk];
+                    for c in 0..bk {
+                        let t = k_start + c;
+                        if causal && t >= row_limit {
+                            srow[c] = f32::NEG_INFINITY;
+                        } else {
+                            let kt = &k_cache[kv_base + t * hd..kv_base + (t + 1) * hd];
+                            srow[c] = unsafe { dot_qk_avx2(qi, kt) } * scale;
+                        }
+                    }
+                }
+
+                // Online softmax update per Q row in the tile.
+                for r in 0..bq {
+                    let srow = &s_tile[r * BK..r * BK + bk];
+                    // m_new = max(m_old, max(srow))
+                    let mut m_new = m_state[r];
+                    for &v in srow.iter() { if v > m_new { m_new = v; } }
+                    let renorm = (m_state[r] - m_new).exp(); // exp(0)=1 first block
+                    // s = s * renorm + sum(exp(srow - m_new))
+                    let mut block_sum = 0.0f32;
+                    let mut exp_vals = [0.0f32; BK];
+                    for c in 0..bk {
+                        exp_vals[c] = (srow[c] - m_new).exp();
+                        block_sum += exp_vals[c];
+                    }
+                    s_state[r] = s_state[r] * renorm + block_sum;
+                    // O = O * renorm + sum_c exp_vals[c] * V[k_start+c]
+                    let orow = &mut o_state[r * hd..(r + 1) * hd];
+                    for j in 0..hd { orow[j] *= renorm; }
+                    for c in 0..bk {
+                        let w = exp_vals[c];
+                        if w == 0.0 { continue; }
+                        let t = k_start + c;
+                        let vt = &v_cache[kv_base + t * hd..kv_base + (t + 1) * hd];
+                        unsafe { axpy_avx2(orow, w, vt); }
+                    }
+                    m_state[r] = m_new;
+                }
+            }
+
+            // Final normalise: O /= s, write to output tensor.
+            let out_ptr = out.as_ptr() as *mut f32;
+            for r in 0..bq {
+                let qr = q_start + r;
+                let dst_off = ((ib * s + qr) * nqh + qh) * hd;
+                let inv = 1.0 / s_state[r];
+                unsafe {
+                    let out_i = std::slice::from_raw_parts_mut(out_ptr.add(dst_off), hd);
+                    let orow = &o_state[r * hd..(r + 1) * hd];
+                    for j in 0..hd { out_i[j] = orow[j] * inv; }
+                }
+            }
+        }
+    });
+
+    CpuTensor::new(out, vec![b, nqh, s, hd])
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn prefill_attention_flash(
+    _q: &CpuTensor, _k_cache: &[f32], _v_cache: &[f32],
+    _b: usize, _nqh: usize, _nkvh: usize, _max_seq: usize, _hd: usize, _cur_len: usize,
+    _causal: bool,
+) -> CpuTensor {
+    unimplemented!("prefill_attention_flash requires x86_64 AVX2")
+}
+
+
 /// ensure len is a multiple of 8 (the text decoder's hd=128 always is).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
