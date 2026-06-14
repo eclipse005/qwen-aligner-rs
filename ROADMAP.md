@@ -141,14 +141,20 @@ audio_encoder 7.0s 内部分解（commit `c5add06`）：
  **conv stem NHWC 进一步优化**：P4-2 register accumulator 需重做（用 `repr(C, align(32))` 的 [f32; 8] 包装 __m256），估计 1.7s→0.5s (省 1.2s)。**高复杂度**
 ### 2. CUDA 性能优化（**进行中** — 越快越好，无预设上限）
 
-当前瓶颈（180s EN 推理 **~5.14s** median of 3, P104-100 sm_61 8GB）:
+当前瓶颈（180s EN 推理 **~4.86s** median of 7, P104-100 sm_61 8GB; 本会话 GPU conv stem 后）:
 
 | 阶段 | 耗时 | 占比 | 备注 |
 |------|------|------|------|
 | prepare_input | 0.25s | 5% | CPU mel/pack (无法 GPU 加速, 已是噪声) |
-| audio_encoder | 1.25s | 24% | conv stem + 24 层; conv stem 内有 3 处 CPU↔GPU roundtrip (见下) |
-| **text_decoder** | **3.6s** | **70%** | 28 层; 每层 qk(grouped GQA) **~130ms** + qkv ~10ms + mlp ~22ms + o ~5ms |
+| audio_encoder | 1.12s | 23% | conv stem (GPU permute+PE 后) + 24 层 |
+| **text_decoder** | **3.3s** | **68%** | 28 层; 每层 qk(grouped GQA) **~130ms** + qkv ~10ms + mlp ~22ms + o ~5ms |
 | timestamp_logits | 0.04s | <1% | gather + download |
+</input>
+> 本会话 GPU 改动: conv stem 的 3 处 CPU↔GPU roundtrip (permute / PE-add / pack) 中的前两处改为 GPU kernel。
+> audio_encoder 1.25s→1.12s, total 5.14s→**4.86s** (-5.4%, RTFx 35x→37x)。
+> 精度 gate: **15s 40/40 vs smoke_en (CPU golden) + 180s 909/909 vs 本会话捕获的 pre-kernel CUDA 输出 (CUDA↔CUDA bit-identical)**。注: 180s CUDA 输出与 CPU golden 有 157 处 <19s 偏差是**预存的 CPU↔CUDA f16 差异** (pre-kernel 二进制同样 157 mismatch), 不是本改动引入的回归。
+> **方向 1 (cuBLAS algo 搜索) 已评估: DEFAULT 已最优**。sweep 25 个 algo (0-23 + default), 10-23 在 sm_61 不支持, 0-9 + default 全在噪声内 (winner algo=1 4.76s vs default 5.04s, 但 3 次复测中位数相同 ~4.98s)。无实际收益, 已回退 harness。
+</input>
 
 每层 (sub-profile, 180s): `rmsn=1.7 qkv=10 **qk=130** softmax=0(fused) av=0(fused) o=5 mlp=22 ms`。
 **grouped GQA (`c188ddf`) 已落地**: 消除了 repeat_kv, 用 stride_a=0 batched GEMM 在 n_rep=2 个 sibling Q head 间共享 K/V。当前是 nkvh=8 次 strided_batched GEMM (batch=2 each) for QK + 同样 8 次 for AV。

@@ -99,6 +99,8 @@ pub(crate) struct CudaKernels {
     pub argmax_into_slot: CudaFunction,
     pub lm_head_gemv_argmax: CudaFunction,
     pub swap_dims_12: CudaFunction,
+    pub permute_bcft_to_btcf: CudaFunction,
+    pub add_pe_broadcast: CudaFunction,
     pub qkv_split: CudaFunction,
     pub qkv_extract_q_norm_rotary: CudaFunction,
     pub qkv_extract_kv_norm_rotary_cache: CudaFunction,
@@ -168,6 +170,8 @@ impl CudaState {
             argmax_into_slot: module.load_function("argmax_into_slot_f16")?,
             lm_head_gemv_argmax: module.load_function("lm_head_gemv_argmax_f16")?,
             swap_dims_12: module.load_function("swap_dims_12_f16")?,
+            permute_bcft_to_btcf: module.load_function("permute_bcft_to_btcf_f16")?,
+            add_pe_broadcast: module.load_function("add_pe_broadcast_f16")?,
             qkv_split: module.load_function("qkv_split_f16")?,
             qkv_extract_q_norm_rotary: module.load_function("qkv_extract_q_norm_rotary_f16")?,
             qkv_extract_kv_norm_rotary_cache: module.load_function("qkv_extract_kv_norm_rotary_cache_f16")?,
@@ -702,6 +706,38 @@ impl CudaState {
         bb.arg(&d0_i); bb.arg(&d1_i); bb.arg(&d2_i); bb.arg(&d3_i);
         unsafe { bb.launch(cfg) }?;
         Ok(GpuTensor::new(out, vec![d0, d2, d1, d3]))
+    }
+
+    /// Permute [b, c, f, t] → [b, t, c, f] (audio conv-stem post-conv layout
+    /// fix-up before conv_out).  Replaces a download→CPU 4-loop→upload roundtrip.
+    pub fn permute_bcft_to_btcf(&self, x: &GpuTensor) -> Result<GpuTensor> {
+        let s = x.shape();
+        assert_eq!(s.len(), 4);
+        let (b, c, f, t) = (s[0], s[1], s[2], s[3]);
+        let mut out = self.alloc_uninit_f16(x.numel())?;
+        let cfg = LaunchConfig::for_num_elems(x.numel() as u32);
+        let b_i = b as i32; let c_i = c as i32; let f_i = f as i32; let t_i = t as i32;
+        let mut bb = self.stream.launch_builder(&self.k.permute_bcft_to_btcf);
+        bb.arg(&mut out); bb.arg(&x.data);
+        bb.arg(&b_i); bb.arg(&c_i); bb.arg(&f_i); bb.arg(&t_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(GpuTensor::new(out, vec![b, t, c, f]))
+    }
+
+    /// In-place add positional encoding with broadcast over the batch dim:
+    /// io[b, t, dm] = f16_round(f32(io) + f32(pe[t, dm])).  Matches the CPU
+    /// path's f16 round-trip add exactly (widens both to f32, adds, rounds).
+    pub fn add_pe_broadcast_inplace(&self, io: &mut GpuTensor, pe: &CudaSlice<f16>,
+        b: usize, t: usize, dm: usize,
+    ) -> Result<()> {
+        let total = b * t * dm;
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        let b_i = b as i32; let t_i = t as i32; let dm_i = dm as i32;
+        let mut bb = self.stream.launch_builder(&self.k.add_pe_broadcast);
+        bb.arg(&io.data); bb.arg(pe);
+        bb.arg(&b_i); bb.arg(&t_i); bb.arg(&dm_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
     }
 
     /// Extract one head-group from a fused QKV tensor in [b, h, s, d] layout.

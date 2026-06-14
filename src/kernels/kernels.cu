@@ -525,6 +525,49 @@ extern "C" __global__ void swap_dims_12_f16(
     dst[tot] = src[src_idx];
 }
 
+// ─── Permute [b, c, f, t] → [b, t, c, f] (audio conv-stem post-conv layout) ─
+// Replaces a download→CPU 4-loop→upload roundtrip in gpu_audio_encoder.rs.
+// Output is contiguous in [b, t, c, f] order, matching the conv_out Linear's
+// expected [b*t, c*f] row-major input.
+extern "C" __global__ void permute_bcft_to_btcf_f16(
+    __half* __restrict__ dst,
+    const __half* __restrict__ src,
+    int b, int c, int f, int t
+) {
+    int tot = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = b * c * f * t;
+    if (tot >= total) return;
+    // dst index decomposition: dst[b][t][c][f] → (ib, it, ic, if)
+    int if_ = tot % f;
+    int ic  = (tot / f) % c;
+    int it  = (tot / (f * c)) % t;
+    int ib  = tot / (f * c * t);
+    // src layout [b, c, f, t]: src[((ib*c + ic)*f + if_)*t + it]
+    int src_idx = ((ib * c + ic) * f + if_) * t + it;
+    dst[tot] = src[src_idx];
+}
+
+// ─── Add positional encoding with broadcast + f16-rounded sum ──────────────
+// out[b, t, dm] = f16_round( f32(out[b,t,j]) + f32(pe[t,j]) )
+// Matches the CPU path's f16::from_f32(f32(a)+f32(b)) exactly (the f16 add is
+// done by widening both operands to f32, adding, then rounding back to f16).
+// This preserves the bit-pattern that downstream f16 ops expect.
+extern "C" __global__ void add_pe_broadcast_f16(
+    __half* __restrict__ io,    // [b, t, dm] in-place
+    const __half* __restrict__ pe,  // [t, dm]
+    int b, int t, int dm
+) {
+    int tot = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = b * t * dm;
+    if (tot >= total) return;
+    int j  = tot % dm;
+    int it = (tot / dm) % t;
+    // pe index ignores b (broadcast): pe[it*dm + j]
+    float a = __half2float(io[tot]);
+    float pv = __half2float(pe[it * dm + j]);
+    io[tot] = __float2half(a + pv);
+}
+
 // ─── Split fused QKV into a single head group ──────────────────────
 // qkv [b, s, total_cols], offset selects start column, h*d contiguous columns.
 // dst [b, h, s, d] (transposed layout from src).

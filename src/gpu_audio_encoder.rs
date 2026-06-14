@@ -245,44 +245,18 @@ impl GpuConvStem {
         let s = x.shape();
         let (b2, c2_dim, f2, t2) = (s[0], s[1], s[2], s[3]);
 
-        // Permute [b, c, f, t] → [b, t, c, f] → reshape [b, t, c*f]
-        // We use a single swap_dims_12 doesn't fit here; do via download for now since
-        // it's small (~31×16×13×480 bytes).  TODO: write permute kernel.
-        let x_cpu = cuda.download_tensor(&x)?;
-        let mut perm = vec![f16::ZERO; b2 * t2 * c2_dim * f2];
-        for ib in 0..b2 {
-            for it in 0..t2 {
-                for ic in 0..c2_dim {
-                    for f in 0..f2 {
-                        let src = ((ib * c2_dim + ic) * f2 + f) * t2 + it;
-                        let dst = ((ib * t2 + it) * c2_dim + ic) * f2 + f;
-                        perm[dst] = x_cpu.data[src];
-                    }
-                }
-            }
-        }
-        let r = cuda.upload_tensor(&CpuTensor::new(perm, vec![b2, t2, c2_dim * f2]))?;
-        let co = self.co.forward(cuda, &r)?;
-        // co: [b2, t2, d_model] — add PE [t2, d_model] broadcast over b2
-        // We do this on CPU since t2 is small and we need to slice/concat after anyway.
-        let co_cpu = cuda.download_tensor(&co)?;
-        let pe_cpu = cuda.stream.clone_dtoh(&self.pe)?;
-        let dm = self.d_model;
-        let mut out = co_cpu.data.clone();
-        for ib in 0..b2 {
-            for it in 0..t2 {
-                let base = (ib * t2 + it) * dm;
-                let pe_base = it * dm;
-                for j in 0..dm {
-                    let v = f32::from(out[base + j]) + f32::from(pe_cpu[pe_base + j]);
-                    out[base + j] = f16::from_f32(v);
-                }
-            }
-        }
+        // Permute [b, c, f, t] → [b, t, c, f] → reshape [b, t, c*f] on GPU.
+        // Replaces a download→CPU 4-loop→upload roundtrip with a single kernel
+        // launch (permute_bcft_to_btcf_f16).
+        let r = cuda.permute_bcft_to_btcf(&x)?
+            .reshape(vec![b2, t2, c2_dim * f2]);
+        let mut co = self.co.forward(cuda, &r)?;
+        // co: [b2, t2, d_model].  Add PE [t2, d_model] broadcast over b2 on GPU,
+        // matching the CPU path's f16_round(f32+f32) exactly (add_pe_broadcast_f16).
+        cuda.add_pe_broadcast_inplace(&mut co, &self.pe, b2, t2, self.d_model)?;
 
         let _ = self.max_pos;
-        let final_gpu = cuda.upload_tensor(&CpuTensor::new(out, vec![b2, t2, dm]))?;
-        Ok((final_gpu, t2))
+        Ok((co, t2))
     }
 }
 
