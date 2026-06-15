@@ -19,6 +19,7 @@ pub struct RawTensor {
 
 impl RawTensor {
     /// Convert raw bytes to a `Vec<f32>`. Supports F32 / F16 / BF16.
+    #[allow(dead_code)]
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         match self.dtype {
             Dtype::F32 => Ok(self.data
@@ -64,6 +65,7 @@ impl RawTensor {
     }
 
     /// (f32_data, shape) — convenience for loaders that need both.
+    #[allow(dead_code)]
     pub fn as_f32(&self) -> Result<(Vec<f32>, Vec<usize>)> {
         Ok((self.to_f32_vec()?, self.shape.clone()))
     }
