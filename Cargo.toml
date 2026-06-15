@@ -42,6 +42,11 @@ hound = "3"
 rustfft = "6"
 anyhow = "1"
 safetensors = "0.4"
+# mmap + zero-copy slice for safetensors weight loading (weights.rs). bytes is
+# pinned to >=1.11: Bytes::from_owner landed in 1.9, and 1.11 fixed a to_vec
+# memory-leak (#773) that the older from_owner path could trigger.
+memmap2 = "0.9"
+bytes = "1.11"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 lindera = { version = "3.0.7", default-features = false, features = ["embed-ipadic"] }

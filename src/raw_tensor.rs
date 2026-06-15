@@ -4,15 +4,22 @@
 //! live in `cudarc_engine` / `cpu_engine`).  `RawTensor` is a deserialization
 //! intermediate; the engines consume the raw bytes and upload them to their
 //! respective devices.
+//!
+//! `data` is a `bytes::Bytes` so it can share one mmap region across all
+//! tensors via O(1) refcount+range slices (see `weights.rs`). `Bytes` derefs
+//! to `&[u8]`, so the conversion paths below are unchanged from the old
+//! `Vec<u8>` field and remain bit-exact.
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use safetensors::Dtype;
 
 /// One tensor as it sits in the safetensors file: raw bytes + shape + dtype.
 #[derive(Debug, Clone)]
 pub struct RawTensor {
     /// Raw little-endian bytes (f32 = 4 bytes, f16/bf16 = 2 bytes, etc.).
-    pub data: Vec<u8>,
+    /// Backed by a refcounted slice of the mmap'd file; cheap to clone.
+    pub data: Bytes,
     pub shape: Vec<usize>,
     pub dtype: Dtype,
 }
