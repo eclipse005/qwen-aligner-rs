@@ -5,6 +5,7 @@ use half::f16;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 use std::time::Instant;
 
