@@ -77,6 +77,22 @@ fn main() -> Result<()> {
             let aligner = load_model(&model, opts)?;
             let result = aligner.align(AlignRequest::from_paths(audio, text, language))?;
             write_forced_align_items_json(&output, &result.items)?;
+            // Optional raw dump for cross-impl diagnostics: write next to the
+            // main output as <output>.raw.json when QWEN_ALIGNER_DUMP_RAW=1.
+            if std::env::var("QWEN_ALIGNER_DUMP_RAW").ok().as_deref() == Some("1") {
+                let raw_path = {
+                    let mut p = output.clone().into_os_string();
+                    p.push(".raw.json");
+                    std::path::PathBuf::from(p)
+                };
+                let payload = serde_json::json!({
+                    "output_ids": result.output_ids,
+                    "raw_timestamp_ms": result.raw_timestamp_ms,
+                    "fixed_timestamp_ms": result.fixed_timestamp_ms,
+                });
+                std::fs::write(&raw_path, serde_json::to_string_pretty(&payload)?)?;
+                println!("raw dump: {}", raw_path.display());
+            }
             println!("align completed: words={}, output={}", result.items.len(), output.display());
         }
         Command::Batch { manifest, model, language, output_dir, device } => {

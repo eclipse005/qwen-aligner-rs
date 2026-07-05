@@ -40,6 +40,13 @@ pub(crate) fn load_wav_mono_16k(path: &Path) -> Result<Vec<f32>> {
             spec.bits_per_sample
         ),
     };
+    if spec.sample_rate == SAMPLE_RATE {
+        return Ok(samples);
+    }
+    // TODO: replace with libsoxr-rs (pure-Rust port of libsoxr) to match
+    // librosa's soxr_hq numerically. This linear-interpolation path lacks
+    // anti-aliasing and is the sole remaining source of divergence from the
+    // Python reference. See docs/ALIGNMENT_HANDOFF.md for the full diagnosis.
     Ok(resample_linear(&samples, spec.sample_rate, SAMPLE_RATE))
 }
 

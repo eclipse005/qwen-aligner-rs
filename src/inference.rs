@@ -1,7 +1,7 @@
 //! Inference engine dispatch.
 
 use anyhow::Context;
-use half::f16;
+use half::bf16;
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,6 @@ use crate::gpu_audio_encoder::GpuAudioEncoder;
 use crate::cpu_engine::{CpuKvCache, CpuTensor};
 use crate::mel::extract_log_mel_features;
 
-const F16_TIMESTAMP_ARGMAX_TIE_EPS: f32 = 1.0 / 256.0;
 
 // ─── Public types ──────────────────────────────────────────────────
 
@@ -111,6 +110,10 @@ pub fn release_model(model: Qwen3ForcedAligner) {
 pub struct Qwen3ForcedAligner {
     config: AlignerConfig,
     tokenizer: crate::tokenizer::QwenTokenizer,
+    /// Japanese word-segmentation model. Loaded from `<model_dir>/nagisa/`
+    /// if present; `None` only disables the Japanese path, leaving English /
+    /// Korean alignment unaffected.
+    tagger: Option<nagisa_rs::Tagger>,
     engine: Engine,
 }
 
@@ -151,11 +154,38 @@ impl Qwen3ForcedAligner {
         info!("Loading tokenizer...");
         let tokenizer = crate::tokenizer::load_qwen_tokenizer(model_dir)?;
 
+        // Japanese word-segmentation model. Optional: only the Japanese path
+        // depends on it; English / Korean alignment work without it.
+        let nagisa_dir = model_dir.join("nagisa");
+        let tagger = if nagisa_dir.is_dir() {
+            match nagisa_rs::Tagger::new(&nagisa_dir) {
+                Ok(t) => {
+                    info!("Loaded nagisa Japanese tokenizer from {}", nagisa_dir.display());
+                    Some(t)
+                }
+                Err(err) => {
+                    info!(
+                        "nagisa model directory found at {} but failed to load ({}); \
+                         Japanese alignment will be unavailable",
+                        nagisa_dir.display(), err
+                    );
+                    None
+                }
+            }
+        } else {
+            info!(
+                "nagisa model directory not found at {}; Japanese alignment will be \
+                 unavailable (other languages are unaffected)",
+                nagisa_dir.display()
+            );
+            None
+        };
+
         let resolved = options.device.resolve()?;
         let engine = build_engine(resolved, &config, &weight_data)?;
 
         info!("Model loaded successfully.");
-        Ok(Self { config, tokenizer, engine })
+        Ok(Self { config, tokenizer, tagger, engine })
     }
 
     pub fn align(&self, request: AlignRequest) -> anyhow::Result<ForcedAlignResult> {
@@ -230,7 +260,7 @@ impl Qwen3ForcedAligner {
             .collect();
         assert_eq!(audio_positions.len(), n_audio_tokens);
         let audio_pos_dev = cuda.stream.clone_htod(&audio_positions)?;
-        let audio_embeds_dev = cuda.upload_f16(&audio_embeds_data)?;
+        let audio_embeds_dev = cuda.upload_bf16(&audio_embeds_data)?;
         let audio_embeds_tensor = GpuTensor::new(
             audio_embeds_dev, vec![n_audio_tokens, hidden_size]
         );
@@ -247,8 +277,8 @@ impl Qwen3ForcedAligner {
             &pos_3d, text_cfg.head_dim, text_cfg.rope_theta,
             &text_cfg.mrope_section(), text_cfg.mrope_interleaved(),
         );
-        let cos_dev = cuda.upload_f16(&cos_cpu.data)?;
-        let sin_dev = cuda.upload_f16(&sin_cpu.data)?;
+        let cos_dev = cuda.upload_bf16(&cos_cpu.data)?;
+        let sin_dev = cuda.upload_bf16(&sin_cpu.data)?;
         profile.mark("rope_compute");
 
         // Text decoder (GPU)
@@ -317,7 +347,7 @@ impl Qwen3ForcedAligner {
                 let dst = tok_idx * hidden_size;
                 let src = audio_idx * hidden_size;
                 for j in 0..hidden_size {
-                    embed_vals[dst + j] = f16::from_f32(audio_embeds_data[src + j].to_f32()).to_f32();
+                    embed_vals[dst + j] = bf16::from_f32(audio_embeds_data[src + j].to_f32()).to_f32();
                 }
                 audio_idx += 1;
             }
@@ -364,7 +394,7 @@ impl Qwen3ForcedAligner {
     /// timestamp positions, chunk calculation, mel packing.
     fn prepare_input(&self, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<PreparedInput> {
         // 1. Text tokenization
-        let (words, aligner_input) = crate::text::encode_timestamp(text, language)?;
+        let (words, aligner_input) = crate::text::encode_timestamp(self.tagger.as_ref(), text, language)?;
         // 2. Mel feature extraction
         let features = extract_log_mel_features(waveform)?;
         // 3. Audio pad expansion
@@ -392,7 +422,7 @@ impl Qwen3ForcedAligner {
         for _ in 0..nfull { chunk_tokens.push(tpc); }
         if tail > 0 { chunk_tokens.push(conv_stem_output_len(tail)); }
 
-        let mut mel_packed: Vec<f16> = vec![f16::ZERO; n_chunks * n_mels * cs];
+        let mut mel_packed: Vec<bf16> = vec![bf16::ZERO; n_chunks * n_mels * cs];
         for chunk in 0..n_chunks {
             let start = chunk * cs;
             let len = cs.min(nf.saturating_sub(start));
@@ -400,7 +430,7 @@ impl Qwen3ForcedAligner {
                 for t in 0..len {
                     let src = mel * nf + start + t;
                     let dst = (chunk * n_mels + mel) * cs + t;
-                    mel_packed[dst] = f16::from_f32(features.values[src]);
+                    mel_packed[dst] = bf16::from_f32(features.values[src]);
                 }
             }
         }
@@ -458,7 +488,7 @@ struct PreparedInput {
     words: Vec<String>,
     input_ids: Vec<i64>,
     timestamp_positions: Vec<usize>,
-    mel_packed: Vec<f16>,
+    mel_packed: Vec<bf16>,
     n_chunks: usize,
     n_mels: usize,
     cs: usize,
@@ -476,14 +506,19 @@ fn conv_stem_output_len(ifr: usize) -> usize {
 }
 
 pub(crate) fn argmax_rows(values: &[f32], cols: usize) -> Vec<i64> {
+    // Match PyTorch `logits.argmax(dim=-1)` exactly: return the *first* index
+    // achieving the row maximum. The previous f16-era implementation used an
+    // epsilon tie-floor (1/256) to absorb f16 rounding, but that diverges from
+    // PyTorch's strict argmax and shifted timestamp-class picks by ±1 bin on
+    // boundary tokens. With bf16 storage matching the Python reference there
+    // is no rounding gap to absorb, so we use the plain first-argmax rule.
     values.chunks(cols).map(|row| {
         let mut best_idx = 0usize;
         let mut best_val = f32::NEG_INFINITY;
         for (i, &v) in row.iter().enumerate() {
             if v > best_val { best_idx = i; best_val = v; }
         }
-        let tie_floor = best_val - F16_TIMESTAMP_ARGMAX_TIE_EPS;
-        row.iter().position(|&v| v >= tie_floor).unwrap_or(best_idx) as i64
+        best_idx as i64
     }).collect()
 }
 

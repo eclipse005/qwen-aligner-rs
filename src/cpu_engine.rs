@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use gemm::{gemm, Parallelism};
-use half::f16;
+use half::{bf16, f16};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -998,8 +998,8 @@ unsafe fn conv_nhwc_direct(
 //   → 24 × { LayerNorm + Self-attention (full) + LayerNorm + FFN (GELU) }
 //   → ln_post + proj1 (GELU) + proj2
 //
-// f16 input (mel spectrogram chunks) → f32 internal (faster on modern x86) → f16 output.
-// Same `run(mel_packed, b_chunks, n_mels, cs, chunk_tokens) → (Vec<f16>, out_dim)` signature
+// bf16 input (mel spectrogram chunks) → f32 internal (faster on modern x86) → bf16 output.
+// Same `run(mel_packed, b_chunks, n_mels, cs, chunk_tokens) → (Vec<bf16>, out_dim)` signature
 // as the GPU encoder, so the dispatch in `inference::align_waveform_text_cpu` can
 // mirror the CUDA path's data flow.
 
@@ -1230,7 +1230,7 @@ impl CpuConvStem {
 
     /// Run conv stem on chunked mel input [b_chunks, 1, n_mels, cs].
     /// Returns (output, t2) where output is [b_chunks, t2, d_model] (with PE added).
-    fn forward(&self, mel_chunks: &[f16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(CpuTensor, usize)> {
+    fn forward(&self, mel_chunks: &[bf16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(CpuTensor, usize)> {
         let t = sub_t0();
         // mel_packed: [b_chunks, 1, n_mels, cs] in NCHW.  Convert to f32.
         let x_data: Vec<f32> = mel_chunks.iter().map(|v| v.to_f32()).collect();
@@ -1528,12 +1528,12 @@ impl CpuAudioEncoder {
     /// Run the full audio encoder on chunked mel input.  Same signature as
     /// `GpuAudioEncoder::run` so the dispatch in `inference::align_waveform_text_cpu`
     /// can mirror the CUDA path's data flow exactly.
-    /// `mel_packed`: flat f16 [b_chunks * 1 * n_mels * cs], NCHW.
+    /// `mel_packed`: flat bf16 [b_chunks * 1 * n_mels * cs], NCHW.
     /// `chunk_tokens[i]`: how many valid tokens chunk i contributes (≤ t2).
-    /// Returns: (f16 [n_total, d_model_proj], output_dim) where d_model_proj is
+    /// Returns: (bf16 [n_total, d_model_proj], output_dim) where d_model_proj is
     /// the final projection's output dimension.
-    pub fn run(&self, mel_packed: &[f16], b_chunks: usize, n_mels: usize, cs: usize,
-               chunk_tokens: &[usize]) -> Result<(Vec<f16>, usize)> {
+    pub fn run(&self, mel_packed: &[bf16], b_chunks: usize, n_mels: usize, cs: usize,
+               chunk_tokens: &[usize]) -> Result<(Vec<bf16>, usize)> {
         // 1. Conv stem → [b_chunks, t2, d_model] with PE
         let (stem_out, t2) = self.conv_stem.forward(mel_packed, b_chunks, n_mels, cs)?;
         let n_total: usize = chunk_tokens.iter().sum();
@@ -1564,8 +1564,8 @@ impl CpuAudioEncoder {
         });
         let h = self.proj2.forward(&h);
 
-        // Cast f32 → f16 for the output.
-        let out: Vec<f16> = h.data.iter().map(|&v| f16::from_f32(v)).collect();
+        // Cast f32 → bf16 for the output (matches the GPU path's storage dtype).
+        let out: Vec<bf16> = h.data.iter().map(|&v| bf16::from_f32(v)).collect();
         Ok((out, self.output_dim))
     }
 }

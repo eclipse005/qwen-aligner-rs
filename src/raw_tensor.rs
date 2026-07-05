@@ -71,6 +71,32 @@ impl RawTensor {
         }
     }
 
+    /// Convert raw bytes to a `Vec<half::bf16>`. Supports F32 / F16 / BF16.
+    ///
+    /// For BF16 on-disk storage (the common case for these checkpoints) this
+    /// is a **bit-exact reinterpret cast** — no rounding — so the values
+    /// loaded into the GPU match what Python's `torch.load(..., dtype=bfloat16)`
+    /// sees, eliminating any dtype-mismatch drift in downstream argmax.
+    pub fn to_bf16_vec(&self) -> Result<Vec<half::bf16>> {
+        match self.dtype {
+            Dtype::BF16 => Ok(self.data
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_ne_bytes([c[0], c[1]]))
+                .collect()),
+            Dtype::F32 => Ok(self.data
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .map(half::bf16::from_f32)
+                .collect()),
+            Dtype::F16 => Ok(self.data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_ne_bytes([c[0], c[1]]).to_f32())
+                .map(half::bf16::from_f32)
+                .collect()),
+            other => Err(anyhow!("unsupported dtype {:?} for to_bf16_vec", other)),
+        }
+    }
+
     /// (f32_data, shape) — convenience for loaders that need both.
     #[allow(dead_code)]
     pub fn as_f32(&self) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -80,5 +106,10 @@ impl RawTensor {
     /// (f16_data, shape) — convenience for loaders that need both.
     pub fn as_f16(&self) -> Result<(Vec<half::f16>, Vec<usize>)> {
         Ok((self.to_f16_vec()?, self.shape.clone()))
+    }
+
+    /// (bf16_data, shape) — convenience for loaders that need both.
+    pub fn as_bf16(&self) -> Result<(Vec<half::bf16>, Vec<usize>)> {
+        Ok((self.to_bf16_vec()?, self.shape.clone()))
     }
 }

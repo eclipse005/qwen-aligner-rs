@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use half::f16;
+use half::bf16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use crate::raw_tensor::RawTensor;
 
 pub(crate) struct GpuLinear {
     pub w: GpuWeight,
-    pub bias: Option<CudaSlice<f16>>,
+    pub bias: Option<CudaSlice<bf16>>,
 }
 
 impl GpuLinear {
@@ -49,8 +49,8 @@ impl GpuLinear {
 }
 
 pub(crate) struct GpuLayerNorm {
-    w: CudaSlice<f16>,
-    bias: CudaSlice<f16>,
+    w: CudaSlice<bf16>,
+    bias: CudaSlice<bf16>,
     eps: f32,
 }
 
@@ -111,7 +111,7 @@ impl GpuAudioAttention {
 
         let attn_out = if let Some(w) = window {
             // Pre-allocate the output buffer [b, nh, s, hd]; each chunk writes its slice via kernel.
-            let mut out_buf = cuda.alloc_zeros_f16(b * nh * s * hd)?;
+            let mut out_buf = cuda.alloc_zeros_bf16(b * nh * s * hd)?;
             for st in (0..s).step_by(w) {
                 let ln = w.min(s - st);
                 let qw = cuda.slice_dim2(&q, st, ln)?;
@@ -187,11 +187,11 @@ impl GpuAudioLayer {
 // ─── Audio encoder transformer (post conv-stem) ────────────────────
 
 pub(crate) struct GpuConvStem {
-    c1_w: CudaSlice<f16>, c1_b: CudaSlice<f16>,
-    c2_w: CudaSlice<f16>, c2_b: CudaSlice<f16>,
-    c3_w: CudaSlice<f16>, c3_b: CudaSlice<f16>,
+    c1_w: CudaSlice<bf16>, c1_b: CudaSlice<bf16>,
+    c2_w: CudaSlice<bf16>, c2_b: CudaSlice<bf16>,
+    c3_w: CudaSlice<bf16>, c3_b: CudaSlice<bf16>,
     co: GpuLinear,
-    pe: CudaSlice<f16>,  // [max_source_positions, d_model]
+    pe: CudaSlice<bf16>,  // [max_source_positions, d_model]
     d_model: usize,
     max_pos: usize,
     c1_out: usize, c2_out: usize, c3_out: usize,
@@ -225,15 +225,15 @@ impl GpuConvStem {
                 pe_f32[p * dm + half + i] = a.cos() as f32;
             }
         }
-        let pe_f16: Vec<f16> = pe_f32.into_iter().map(f16::from_f32).collect();
-        let pe = cuda.upload_f16(&pe_f16)?;
+        let pe_f16: Vec<bf16> = pe_f32.into_iter().map(bf16::from_f32).collect();
+        let pe = cuda.upload_bf16(&pe_f16)?;
 
         Ok(Self { c1_w, c1_b, c2_w, c2_b, c3_w, c3_b, co, pe, d_model: dm, max_pos, c1_out, c2_out, c3_out })
     }
 
     /// Run conv stem on chunked mel input [b_chunks, 1, 128, cs] → [b_chunks, t2, d_model] flat output.
     /// Returns (flat output, t2_per_chunk).
-    pub fn forward(&self, cuda: &CudaState, mel_chunks: &[f16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(GpuTensor, usize)> {
+    pub fn forward(&self, cuda: &CudaState, mel_chunks: &[bf16], b_chunks: usize, n_mels: usize, cs: usize) -> Result<(GpuTensor, usize)> {
         // Upload mel chunks as [b_chunks, 1, n_mels, cs].
         let x_cpu = CpuTensor::new(mel_chunks.to_vec(), vec![b_chunks, 1, n_mels, cs]);
         let x = cuda.upload_tensor(&x_cpu)?;
@@ -252,7 +252,7 @@ impl GpuConvStem {
             .reshape(vec![b2, t2, c2_dim * f2]);
         let mut co = self.co.forward(cuda, &r)?;
         // co: [b2, t2, d_model].  Add PE [t2, d_model] broadcast over b2 on GPU,
-        // matching the CPU path's f16_round(f32+f32) exactly (add_pe_broadcast_f16).
+        // matching the CPU path's bf16_round(f32+f32) exactly (add_pe_broadcast_f16).
         cuda.add_pe_broadcast_inplace(&mut co, &self.pe, b2, t2, self.d_model)?;
 
         let _ = self.max_pos;
@@ -286,13 +286,13 @@ impl GpuAudioEncoder {
     }
 
     /// Run the full audio encoder on chunked mel input.
-    /// mel_chunks: [b_chunks * 1 * n_mels * cs] f16 flat array (zero-padded tail chunk).
+    /// mel_chunks: [b_chunks * 1 * n_mels * cs] bf16 flat array (zero-padded tail chunk).
     /// chunk_tokens[i] = how many tokens the i-th chunk contributes (tpc for full, feo(tail) for partial).
-    /// Returns (output_data, output_dim) — flat [n_tokens, output_dim] f16.
+    /// Returns (output_data, output_dim) — flat [n_tokens, output_dim] bf16.
     ///
     /// Aligner uses **full attention** (no windowing), so we pass `None` to layer.forward.
-    pub fn run(&self, mel_chunks: &[f16], b_chunks: usize, n_mels: usize, cs: usize,
-               chunk_tokens: &[usize]) -> Result<(Vec<f16>, usize)>
+    pub fn run(&self, mel_chunks: &[bf16], b_chunks: usize, n_mels: usize, cs: usize,
+               chunk_tokens: &[usize]) -> Result<(Vec<bf16>, usize)>
     {
         let cuda = &self.cuda;
         // 1. Conv stem

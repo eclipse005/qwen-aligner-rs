@@ -1,8 +1,4 @@
 use anyhow::{Context, Result};
-use lindera::dictionary::load_dictionary;
-use lindera::mode::Mode;
-use lindera::segmenter::Segmenter;
-use lindera::tokenizer::Tokenizer as LinderaTokenizer;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -115,35 +111,38 @@ pub fn tokenize_korean(text: &str) -> Vec<String> {
     tokens
 }
 
-fn tokenize_japanese(text: &str) -> Result<Vec<String>> {
-    static TOKENIZER: OnceLock<Result<LinderaTokenizer, String>> = OnceLock::new();
-    let tokenizer = TOKENIZER
-        .get_or_init(|| {
-            let dictionary = load_dictionary("embedded://ipadic")
-                .map_err(|err| format!("failed to load embedded Lindera IPADIC: {err}"))?;
-            let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-            Ok(LinderaTokenizer::new(segmenter))
-        })
-        .as_ref()
-        .map_err(|err| anyhow::anyhow!(err.clone()))?;
-
+/// Japanese tokenization via the bundled nagisa-rs model.
+///
+/// `tagger.tagging(text).words` is byte-for-byte identical to upstream
+/// Python `nagisa.tagging(text).words` (the same call the reference
+/// `qwen_asr.Qwen3ForceAlignProcessor` makes), so JA word boundaries — and
+/// therefore the timestamp-token layout — match the original implementation.
+fn tokenize_japanese(tagger: &nagisa_rs::Tagger, text: &str) -> Vec<String> {
     let mut words = Vec::new();
-    for token in tokenizer
-        .tokenize(text)
-        .context("failed to tokenize Japanese text with Lindera")?
-    {
-        let cleaned = clean_token(token.surface.as_ref());
+    for word in tagger.tagging(text).words {
+        let cleaned = clean_token(&word);
         if !cleaned.is_empty() {
             words.push(cleaned);
         }
     }
-    Ok(words)
+    words
 }
 
-pub fn encode_timestamp(text: &str, language: &str) -> Result<(Vec<String>, String)> {
+/// Build the `<|audio_start|>...<timestamp>...` input string and the
+/// side-channel `words` list used to parse timestamp output.
+///
+/// `tagger` is required only for the Japanese path; other languages ignore
+/// it and the caller may pass `None`.
+pub fn encode_timestamp(
+    tagger: Option<&nagisa_rs::Tagger>,
+    text: &str,
+    language: &str,
+) -> Result<(Vec<String>, String)> {
     let lang = language.to_lowercase();
     let words = if lang == "japanese" {
-        tokenize_japanese(text)?
+        let t = tagger.context("Japanese alignment requires the nagisa model (models/.../nagisa/); \
+                                 this directory was not found at load time")?;
+        tokenize_japanese(t, text)
     } else if lang == "korean" {
         tokenize_korean(text)
     } else {
@@ -162,9 +161,20 @@ pub fn encode_timestamp(text: &str, language: &str) -> Result<(Vec<String>, Stri
 mod tests {
     use super::*;
 
+    fn nagisa_model_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join("Qwen3-ForcedAligner-0.6B")
+            .join("nagisa")
+    }
+
+    fn tagger() -> nagisa_rs::Tagger {
+        nagisa_rs::Tagger::new(nagisa_model_dir()).expect("load nagisa model")
+    }
+
     #[test]
     fn english_timestamp_text_matches_python_shape() {
-        let (words, input) = encode_timestamp("All right, we purse.", "English").unwrap();
+        let (words, input) = encode_timestamp(None, "All right, we purse.", "English").unwrap();
         assert_eq!(words, vec!["All", "right", "we", "purse"]);
         assert_eq!(
             input,
@@ -174,14 +184,22 @@ mod tests {
 
     #[test]
     fn keeps_apostrophe_and_splits_cjk_inside_space_language() {
-        let (words, _) = encode_timestamp("don't ABC中国 123.", "English").unwrap();
+        let (words, _) = encode_timestamp(None, "don't ABC中国 123.", "English").unwrap();
         assert_eq!(words, vec!["don't", "ABC", "中", "国", "123"]);
     }
 
+    /// Reference tokenization comes from upstream Python
+    /// `nagisa.tagging(text).words` (after `Qwen3ForceAlignProcessor.clean_token`
+    /// strips the trailing `。`, which is what the reference impl produces too).
     #[test]
-    fn japanese_timestamp_text_handles_basic_lindera_tokens() {
-        let (words, _) =
-            encode_timestamp("女子アナの仕事に耐える。辛抱大工です。", "Japanese").unwrap();
+    fn japanese_timestamp_text_matches_nagisa_reference_short() {
+        let t = tagger();
+        let (words, _) = encode_timestamp(
+            Some(&t),
+            "女子アナの仕事に耐える。辛抱大工です。",
+            "Japanese",
+        )
+        .unwrap();
         assert_eq!(
             words,
             vec![
@@ -199,12 +217,18 @@ mod tests {
     }
 
     #[test]
-    fn japanese_timestamp_text_uses_lindera_ipadic_boundaries() {
+    fn japanese_timestamp_text_matches_nagisa_reference_long() {
+        let t = tagger();
         let (words, _) = encode_timestamp(
+            Some(&t),
             "本日は島根県にある有名な人気ラーメン店にやってきました。",
             "Japanese",
         )
         .unwrap();
+        // nagisa produces finer-grained verb inflections than MeCab/IPADIC
+        // (やっ/て/き/まし/た instead of やってき/まし/た) — these are the
+        // exact tokens Python nagisa emits, and what the reference aligner
+        // feeds into the model.
         assert_eq!(
             words,
             vec![
@@ -220,7 +244,9 @@ mod tests {
                 "ラーメン",
                 "店",
                 "に",
-                "やってき",
+                "やっ",
+                "て",
+                "き",
                 "まし",
                 "た"
             ]
@@ -229,7 +255,7 @@ mod tests {
 
     #[test]
     fn korean_timestamp_text_matches_soynlp_ltokenizer_reference() {
-        let (words, _) = encode_timestamp("안녕하세요 여러분 나는 학교에 간다", "Korean").unwrap();
+        let (words, _) = encode_timestamp(None, "안녕하세요 여러분 나는 학교에 간다", "Korean").unwrap();
         assert_eq!(
             words,
             vec!["안녕", "하세요", "여러분", "나는", "학교", "에", "간다"]

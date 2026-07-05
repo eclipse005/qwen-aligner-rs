@@ -1,8 +1,8 @@
 // GPU element-wise kernels for the Qwen3-ASR text decoder + audio encoder.
-// All arithmetic accumulates in f32 but storage is f16.
+// All arithmetic accumulates in f32 but storage is bf16.
 // Targets sm_61+ (no requirement for tensor cores or f16 atomics).
 
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #ifndef INFINITY
 #define INFINITY __int_as_float(0x7f800000)
@@ -11,10 +11,10 @@
 // ─── RMS norm: x [outer, last] * weight[last] → out, with f32 accumulation ──
 // One block per row; block_size threads cooperate over `last`.
 // Shared mem: block_size * sizeof(float).
-extern "C" __global__ void rms_norm_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
-    const __half* __restrict__ w,
+extern "C" __global__ void rms_norm_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
     int last,
     int outer,
     float eps
@@ -28,7 +28,7 @@ extern "C" __global__ void rms_norm_f16(
 
     float local = 0.0f;
     for (int j = tid; j < last; j += bs) {
-        float v = __half2float(x[row * last + j]);
+        float v = __bfloat162float(x[row * last + j]);
         local += v * v;
     }
     sdata[tid] = local;
@@ -41,19 +41,19 @@ extern "C" __global__ void rms_norm_f16(
     float inv_rms = rsqrtf(sdata[0] / (float)last + eps);
 
     for (int j = tid; j < last; j += bs) {
-        float v = __half2float(x[row * last + j]) * inv_rms * __half2float(w[j]);
-        out[row * last + j] = __float2half(v);
+        float v = __bfloat162float(x[row * last + j]) * inv_rms * __bfloat162float(w[j]);
+        out[row * last + j] = __float2bfloat16(v);
     }
 }
 
 // ─── Fused: residual_inplace = residual + add_in; out = rms_norm(residual_inplace, w) ──
 // Writes `residual_inplace` with the residual sum AND `out` with the normed result.
 // Shared mem: bs * sizeof(float).
-extern "C" __global__ void add_residual_rms_norm_f16(
-    __half* __restrict__ residual_inplace,   // r' = r + a
-    __half* __restrict__ out,                // out = rms_norm(r', w)
-    const __half* __restrict__ add_in,
-    const __half* __restrict__ w,
+extern "C" __global__ void add_residual_rms_norm_bf16(
+    __nv_bfloat16* __restrict__ residual_inplace,   // r' = r + a
+    __nv_bfloat16* __restrict__ out,                // out = rms_norm(r', w)
+    const __nv_bfloat16* __restrict__ add_in,
+    const __nv_bfloat16* __restrict__ w,
     int last,
     int outer,
     float eps
@@ -68,10 +68,10 @@ extern "C" __global__ void add_residual_rms_norm_f16(
     // Pass 1: residual sum + sum of squares
     float local = 0.0f;
     for (int j = tid; j < last; j += bs) {
-        float r = __half2float(residual_inplace[row * last + j]);
-        float a = __half2float(add_in[row * last + j]);
+        float r = __bfloat162float(residual_inplace[row * last + j]);
+        float a = __bfloat162float(add_in[row * last + j]);
         float v = r + a;
-        residual_inplace[row * last + j] = __float2half(v);
+        residual_inplace[row * last + j] = __float2bfloat16(v);
         local += v * v;
     }
     sdata[tid] = local;
@@ -84,54 +84,54 @@ extern "C" __global__ void add_residual_rms_norm_f16(
 
     // Pass 2: normalize
     for (int j = tid; j < last; j += bs) {
-        float v = __half2float(residual_inplace[row * last + j]) * inv_rms * __half2float(w[j]);
-        out[row * last + j] = __float2half(v);
+        float v = __bfloat162float(residual_inplace[row * last + j]) * inv_rms * __bfloat162float(w[j]);
+        out[row * last + j] = __float2bfloat16(v);
     }
 }
 
 // ─── Element-wise add: out = a + b ─────────────────────────────────
-extern "C" __global__ void add_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ a,
-    const __half* __restrict__ b,
+extern "C" __global__ void add_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+    out[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
 }
 
 // ─── In-place add: a += b ──────────────────────────────────────────
-extern "C" __global__ void add_inplace_f16(
-    __half* __restrict__ a,
-    const __half* __restrict__ b,
+extern "C" __global__ void add_inplace_bf16(
+    __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    a[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+    a[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
 }
 
 // ─── SiLU(gate) * up (SwiGLU activation) ───────────────────────────
-extern "C" __global__ void silu_mul_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ gate,
-    const __half* __restrict__ up,
+extern "C" __global__ void silu_mul_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = __half2float(gate[i]);
+    float g = __bfloat162float(gate[i]);
     float sig = 1.0f / (1.0f + expf(-g));
-    out[i] = __float2half(g * sig * __half2float(up[i]));
+    out[i] = __float2bfloat16(g * sig * __bfloat162float(up[i]));
 }
 
 // ─── Fused gate-up split + SiLU(gate)*up ──────────────────────────
 // gu: [outer, 2*inter] in row-major (gate first half of last dim, up second half).
 // Writes activated [outer, inter].
-extern "C" __global__ void silu_mul_split_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ gu,
+extern "C" __global__ void silu_mul_split_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gu,
     int outer,
     int inter
 ) {
@@ -140,18 +140,18 @@ extern "C" __global__ void silu_mul_split_f16(
     int o = i / inter;
     int c = i % inter;
     int base = o * 2 * inter;
-    float g = __half2float(gu[base + c]);
-    float u = __half2float(gu[base + inter + c]);
+    float g = __bfloat162float(gu[base + c]);
+    float u = __bfloat162float(gu[base + inter + c]);
     float sig = 1.0f / (1.0f + expf(-g));
-    out[i] = __float2half(g * sig * u);
+    out[i] = __float2bfloat16(g * sig * u);
 }
 
 // ─── Softmax with scale + optional causal mask ─────────────────────
 // x shape (logical [bh, m, n]) launched as grid = (bh * m,). One block per row.
 // is_causal != 0 keeps positions [0..row_in_m+1) only.
-extern "C" __global__ void softmax_scaled_causal_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
+extern "C" __global__ void softmax_scaled_causal_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
     int m,
     int n,
     float scale,
@@ -169,7 +169,7 @@ extern "C" __global__ void softmax_scaled_causal_f16(
     // Max
     float local_max = -INFINITY;
     for (int j = tid; j < valid_n; j += bs) {
-        float v = __half2float(x[row * n + j]) * scale;
+        float v = __bfloat162float(x[row * n + j]) * scale;
         if (v > local_max) local_max = v;
     }
     sdata[tid] = local_max;
@@ -184,7 +184,7 @@ extern "C" __global__ void softmax_scaled_causal_f16(
     // Sum
     float local_sum = 0.0f;
     for (int j = tid; j < valid_n; j += bs) {
-        local_sum += expf(__half2float(x[row * n + j]) * scale - row_max);
+        local_sum += expf(__bfloat162float(x[row * n + j]) * scale - row_max);
     }
     sdata[tid] = local_sum;
     __syncthreads();
@@ -196,10 +196,10 @@ extern "C" __global__ void softmax_scaled_causal_f16(
 
     for (int j = tid; j < n; j += bs) {
         if (j < valid_n) {
-            float v = __half2float(x[row * n + j]) * scale - row_max;
-            out[row * n + j] = __float2half(expf(v) * inv_sum);
+            float v = __bfloat162float(x[row * n + j]) * scale - row_max;
+            out[row * n + j] = __float2bfloat16(expf(v) * inv_sum);
         } else {
-            out[row * n + j] = __float2half(0.0f);
+            out[row * n + j] = __float2bfloat16(0.0f);
         }
     }
 }
@@ -209,9 +209,9 @@ extern "C" __global__ void softmax_scaled_causal_f16(
 // Caller MUST zero the output buffer before launching (we skip writing
 // masked-tail positions so AV-matmul reads valid zeros there).
 // Shared memory layout: [bs floats max][bs floats sum] = bs*8 bytes.
-extern "C" __global__ void softmax_scaled_causal_online_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
+extern "C" __global__ void softmax_scaled_causal_online_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
     int m,
     int n,
     float scale,
@@ -232,7 +232,7 @@ extern "C" __global__ void softmax_scaled_causal_online_f16(
     float my_max = -INFINITY;
     float my_sum = 0.0f;
     for (int j = tid; j < valid_n; j += bs) {
-        float v = __half2float(x[row * n + j]) * scale;
+        float v = __bfloat162float(x[row * n + j]) * scale;
         if (v > my_max) {
             my_sum = my_sum * __expf(my_max - v) + 1.0f;
             my_max = v;
@@ -264,23 +264,23 @@ extern "C" __global__ void softmax_scaled_causal_online_f16(
 
     // Write only valid positions; masked tail is left at the pre-zeroed value.
     for (int j = tid; j < valid_n; j += bs) {
-        float v = __half2float(x[row * n + j]) * scale - row_max;
-        out[row * n + j] = __float2half(__expf(v) * inv_sum);
+        float v = __bfloat162float(x[row * n + j]) * scale - row_max;
+        out[row * n + j] = __float2bfloat16(__expf(v) * inv_sum);
     }
     // Zero the masked tail in a separate loop so the hot path has no branch.
     for (int j = valid_n + tid; j < n; j += bs) {
-        out[row * n + j] = __float2half(0.0f);
+        out[row * n + j] = __float2bfloat16(0.0f);
     }
 }
 
 // ─── Rotary embedding ──────────────────────────────────────────────
 // x [b, h, s, d], cos/sin [total_s, d] (broadcast over b, h, indexed at pos_offset+is).
 // rotate_half: for i<half → -x[i+half], for i>=half → x[i-half].
-extern "C" __global__ void rotary_emb_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
-    const __half* __restrict__ cos,
-    const __half* __restrict__ sin,
+extern "C" __global__ void rotary_emb_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
     int b, int h, int s, int d, int pos_offset
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -291,27 +291,27 @@ extern "C" __global__ void rotary_emb_f16(
     int is = (tot / d) % s;
     int half_ = d >> 1;
 
-    float x_val = __half2float(x[tot]);
+    float x_val = __bfloat162float(x[tot]);
     float pair_val = (id < half_)
-        ? -__half2float(x[tot + half_])
-        :  __half2float(x[tot - half_]);
+        ? -__bfloat162float(x[tot + half_])
+        :  __bfloat162float(x[tot - half_]);
 
     int row = pos_offset + is;
-    float c = __half2float(cos[row * d + id]);
-    float si = __half2float(sin[row * d + id]);
-    out[tot] = __float2half(x_val * c + pair_val * si);
+    float c = __bfloat162float(cos[row * d + id]);
+    float si = __bfloat162float(sin[row * d + id]);
+    out[tot] = __float2bfloat16(x_val * c + pair_val * si);
 }
 
 // ─── Fused RMSNorm + rotary embedding (Q/K path) ───────────────────
 // Per-row norm over head_dim, then rotary on the same row.
 // x [b, h, s, d], weight [d], cos/sin [total_s, d] indexed at pos_offset+is.
 // Grid = (b*h*s,); one block per (head, seq) row.
-extern "C" __global__ void rms_norm_rotary_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
-    const __half* __restrict__ w,
-    const __half* __restrict__ cos,
-    const __half* __restrict__ sin,
+extern "C" __global__ void rms_norm_rotary_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
     int b, int h, int s, int d, int pos_offset, float eps
 ) {
     int row = blockIdx.x;          // global row index over b*h*s
@@ -327,7 +327,7 @@ extern "C" __global__ void rms_norm_rotary_f16(
     // Compute sum of squares
     float local = 0.0f;
     for (int j = tid; j < d; j += bs) {
-        float v = __half2float(x[row * d + j]);
+        float v = __bfloat162float(x[row * d + j]);
         local += v * v;
     }
     sdata[tid] = local;
@@ -342,13 +342,13 @@ extern "C" __global__ void rms_norm_rotary_f16(
     // Cheap workaround: load x[pj], scale by inv_rms * w[pj].
     int half_ = d >> 1;
     for (int j = tid; j < d; j += bs) {
-        float x_val_j  = __half2float(x[row * d + j])  * inv_rms * __half2float(w[j]);
+        float x_val_j  = __bfloat162float(x[row * d + j])  * inv_rms * __bfloat162float(w[j]);
         int pj = (j < half_) ? (j + half_) : (j - half_);
-        float x_pair   = __half2float(x[row * d + pj]) * inv_rms * __half2float(w[pj]);
+        float x_pair   = __bfloat162float(x[row * d + pj]) * inv_rms * __bfloat162float(w[pj]);
         float pair_val = (j < half_) ? -x_pair : x_pair;
-        float c = __half2float(cos[cs_row * d + j]);
-        float si = __half2float(sin[cs_row * d + j]);
-        out[row * d + j] = __float2half(x_val_j * c + pair_val * si);
+        float c = __bfloat162float(cos[cs_row * d + j]);
+        float si = __bfloat162float(sin[cs_row * d + j]);
+        out[row * d + j] = __float2bfloat16(x_val_j * c + pair_val * si);
     }
 }
 
@@ -356,9 +356,9 @@ extern "C" __global__ void rms_norm_rotary_f16(
 // cache layout (per-layer): [b, nkvh, max_seq, d]; valid rows [0..cur_len).
 // Output dst [b, nqh, cur_len, d] contiguous (cur_len-major within head).
 // ─── Embedding lookup ─────────────────────────────────────────────
-extern "C" __global__ void embed_lookup_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ table,
+extern "C" __global__ void embed_lookup_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ table,
     const long long* __restrict__ ids,
     int n, int d
 ) {
@@ -375,9 +375,9 @@ extern "C" __global__ void embed_lookup_f16(
 // ─── Single-token embed lookup, id read from GPU i32 buffer ──────
 // Used by the decode hot loop to chain argmax (writes ids[slot]) → embed (reads ids[slot])
 // without an htod round-trip.
-extern "C" __global__ void embed_lookup_single_i32_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ table,
+extern "C" __global__ void embed_lookup_single_i32_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ table,
     const int* __restrict__ ids,
     int slot,
     int d
@@ -403,10 +403,10 @@ extern "C" __global__ void embed_lookup_single_i32_f16(
 // each thread covers a stripe of vocab rows. cur GPU (P104, sm_61) can handle this fine
 // because vocab~151936 / 1024 threads = ~148 dot-products per thread, each 1024 multiplies.
 // Total ~152M ops per token, ~5ms on f16 — acceptable, saves alloc + launch overhead.
-extern "C" __global__ void lm_head_gemv_argmax_f16(
+extern "C" __global__ void lm_head_gemv_argmax_bf16(
     int* __restrict__ out_idx,
-    const __half* __restrict__ hidden,      // [hs]
-    const __half* __restrict__ embed_table, // [vocab, hs]   row-major
+    const __nv_bfloat16* __restrict__ hidden,      // [hs]
+    const __nv_bfloat16* __restrict__ embed_table, // [vocab, hs]   row-major
     int vocab, int hs
 ) {
     int tid = threadIdx.x;
@@ -416,9 +416,9 @@ extern "C" __global__ void lm_head_gemv_argmax_f16(
     int local_idx = 0;
     for (int v = tid; v < vocab; v += bs) {
         float dot = 0.0f;
-        const __half* row = embed_table + v * hs;
+        const __nv_bfloat16* row = embed_table + v * hs;
         for (int j = 0; j < hs; j++) {
-            dot += __half2float(hidden[j]) * __half2float(row[j]);
+            dot += __bfloat162float(hidden[j]) * __bfloat162float(row[j]);
         }
         if (dot > local_max) { local_max = dot; local_idx = v; }
     }
@@ -441,9 +441,9 @@ extern "C" __global__ void lm_head_gemv_argmax_f16(
 }
 
 // ─── Argmax over a vector of length n (single block) ───────────────
-extern "C" __global__ void argmax_f16(
+extern "C" __global__ void argmax_bf16(
     int* __restrict__ out_idx,
-    const __half* __restrict__ x,
+    const __nv_bfloat16* __restrict__ x,
     int n
 ) {
     int tid = threadIdx.x;
@@ -454,7 +454,7 @@ extern "C" __global__ void argmax_f16(
     float local_max = -INFINITY;
     int local_idx = 0;
     for (int i = tid; i < n; i += bs) {
-        float v = __half2float(x[i]);
+        float v = __bfloat162float(x[i]);
         if (v > local_max) { local_max = v; local_idx = i; }
     }
     smax[tid] = local_max;
@@ -472,12 +472,12 @@ extern "C" __global__ void argmax_f16(
     if (tid == 0) *out_idx = sidx[0];
 }
 
-// Same as argmax_f16 but writes into out_idx[slot] instead of out_idx[0].
+// Same as argmax_bf16 but writes into out_idx[slot] instead of out_idx[0].
 // Lets the decode loop reuse a single i32 buffer across all steps and chain
-// the result into embed_lookup_single_i32_f16 without an htod round-trip.
-extern "C" __global__ void argmax_into_slot_f16(
+// the result into embed_lookup_single_i32_bf16 without an htod round-trip.
+extern "C" __global__ void argmax_into_slot_bf16(
     int* __restrict__ out_idx,
-    const __half* __restrict__ x,
+    const __nv_bfloat16* __restrict__ x,
     int n,
     int slot
 ) {
@@ -489,7 +489,7 @@ extern "C" __global__ void argmax_into_slot_f16(
     float local_max = -INFINITY;
     int local_idx = 0;
     for (int i = tid; i < n; i += bs) {
-        float v = __half2float(x[i]);
+        float v = __bfloat162float(x[i]);
         if (v > local_max) { local_max = v; local_idx = i; }
     }
     smax[tid] = local_max;
@@ -509,9 +509,9 @@ extern "C" __global__ void argmax_into_slot_f16(
 
 // ─── Swap dims 1 and 2 of a 4-D tensor ─────────────────────────────
 // src [d0, d1, d2, d3] (contig) → dst [d0, d2, d1, d3] (contig)
-extern "C" __global__ void swap_dims_12_f16(
-    __half* __restrict__ dst,
-    const __half* __restrict__ src,
+extern "C" __global__ void swap_dims_12_bf16(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
     int d0, int d1, int d2, int d3
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -529,9 +529,9 @@ extern "C" __global__ void swap_dims_12_f16(
 // Replaces a download→CPU 4-loop→upload roundtrip in gpu_audio_encoder.rs.
 // Output is contiguous in [b, t, c, f] order, matching the conv_out Linear's
 // expected [b*t, c*f] row-major input.
-extern "C" __global__ void permute_bcft_to_btcf_f16(
-    __half* __restrict__ dst,
-    const __half* __restrict__ src,
+extern "C" __global__ void permute_bcft_to_btcf_bf16(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
     int b, int c, int f, int t
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -552,9 +552,9 @@ extern "C" __global__ void permute_bcft_to_btcf_f16(
 // Matches the CPU path's f16::from_f32(f32(a)+f32(b)) exactly (the f16 add is
 // done by widening both operands to f32, adding, then rounding back to f16).
 // This preserves the bit-pattern that downstream f16 ops expect.
-extern "C" __global__ void add_pe_broadcast_f16(
-    __half* __restrict__ io,    // [b, t, dm] in-place
-    const __half* __restrict__ pe,  // [t, dm]
+extern "C" __global__ void add_pe_broadcast_bf16(
+    __nv_bfloat16* __restrict__ io,    // [b, t, dm] in-place
+    const __nv_bfloat16* __restrict__ pe,  // [t, dm]
     int b, int t, int dm
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -563,17 +563,17 @@ extern "C" __global__ void add_pe_broadcast_f16(
     int j  = tot % dm;
     int it = (tot / dm) % t;
     // pe index ignores b (broadcast): pe[it*dm + j]
-    float a = __half2float(io[tot]);
-    float pv = __half2float(pe[it * dm + j]);
-    io[tot] = __float2half(a + pv);
+    float a = __bfloat162float(io[tot]);
+    float pv = __bfloat162float(pe[it * dm + j]);
+    io[tot] = __float2bfloat16(a + pv);
 }
 
 // ─── Split fused QKV into a single head group ──────────────────────
 // qkv [b, s, total_cols], offset selects start column, h*d contiguous columns.
 // dst [b, h, s, d] (transposed layout from src).
-extern "C" __global__ void qkv_split_f16(
-    __half* __restrict__ dst,
-    const __half* __restrict__ qkv,
+extern "C" __global__ void qkv_split_bf16(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ qkv,
     int b, int s, int h, int d, int total_cols, int offset
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -592,12 +592,12 @@ extern "C" __global__ void qkv_split_f16(
 // qkv [b, s, total_cols]; Q occupies columns [0..q_dim) with q_dim = nqh*d.
 // Output q_out [b, nqh, s, d]; weight [d]; cos/sin [total_s, d] indexed at pos_offset+is.
 // Grid = (b*nqh*s,) one block per (head, seq) row, threads cooperate over d.
-extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
-    __half* __restrict__ q_out,
-    const __half* __restrict__ qkv,
-    const __half* __restrict__ w,
-    const __half* __restrict__ cos,
-    const __half* __restrict__ sin,
+extern "C" __global__ void qkv_extract_q_norm_rotary_bf16(
+    __nv_bfloat16* __restrict__ q_out,
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
     int b, int nqh, int s, int d, int total_cols, int pos_offset, float eps
 ) {
     int row = blockIdx.x;          // global row index over b*nqh*s
@@ -611,14 +611,14 @@ extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
     int cs_row = pos_offset + is;
 
     // qkv row pointer: Q is at columns [ih*d .. ih*d + d) in row (ib, is).
-    const __half* src = qkv + (ib * s + is) * total_cols + ih * d;
+    const __nv_bfloat16* src = qkv + (ib * s + is) * total_cols + ih * d;
 
     extern __shared__ float sdata[];
 
     // Sum of squares (load Q values inline; we read them twice but cheap vs DRAM trip).
     float local = 0.0f;
     for (int j = tid; j < d; j += bs) {
-        float v = __half2float(src[j]);
+        float v = __bfloat162float(src[j]);
         local += v * v;
     }
     sdata[tid] = local;
@@ -631,13 +631,13 @@ extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
 
     int half_ = d >> 1;
     for (int j = tid; j < d; j += bs) {
-        float x_val_j  = __half2float(src[j])  * inv_rms * __half2float(w[j]);
+        float x_val_j  = __bfloat162float(src[j])  * inv_rms * __bfloat162float(w[j]);
         int pj = (j < half_) ? (j + half_) : (j - half_);
-        float x_pair   = __half2float(src[pj]) * inv_rms * __half2float(w[pj]);
+        float x_pair   = __bfloat162float(src[pj]) * inv_rms * __bfloat162float(w[pj]);
         float pair_val = (j < half_) ? -x_pair : x_pair;
-        float c = __half2float(cos[cs_row * d + j]);
-        float si = __half2float(sin[cs_row * d + j]);
-        q_out[row * d + j] = __float2half(x_val_j * c + pair_val * si);
+        float c = __bfloat162float(cos[cs_row * d + j]);
+        float si = __bfloat162float(sin[cs_row * d + j]);
+        q_out[row * d + j] = __float2bfloat16(x_val_j * c + pair_val * si);
     }
 }
 
@@ -645,15 +645,15 @@ extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
 //     write Q to q_out, K to k_cache, V to v_cache.  One launch replaces two.
 // Grid: x = b*s,  y = nqh + nkvh  (head slot)
 // Block: d threads cooperate over one row of head_dim.
-extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
-    __half* __restrict__ q_out,
-    __half* __restrict__ k_cache,
-    __half* __restrict__ v_cache,
-    const __half* __restrict__ qkv,
-    const __half* __restrict__ qn_w,
-    const __half* __restrict__ kn_w,
-    const __half* __restrict__ cos,
-    const __half* __restrict__ sin,
+extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_bf16(
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ qn_w,
+    const __nv_bfloat16* __restrict__ kn_w,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
     int b, int nqh, int nkvh, int s, int d, int total_cols,
     int q_dim, int kv_dim, int max_seq, int start, int pos_offset, float eps
 ) {
@@ -671,11 +671,11 @@ extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
     if (hy < nqh) {
         // Q path
         int ih = hy;
-        const __half* src = qkv + (ib * s + is) * total_cols + ih * d;
-        __half* dst = q_out + ((ib * nqh + ih) * s + is) * d;
+        const __nv_bfloat16* src = qkv + (ib * s + is) * total_cols + ih * d;
+        __nv_bfloat16* dst = q_out + ((ib * nqh + ih) * s + is) * d;
         float local = 0.0f;
         for (int j = tid; j < d; j += bs) {
-            float v = __half2float(src[j]);
+            float v = __bfloat162float(src[j]);
             local += v * v;
         }
         sdata[tid] = local;
@@ -686,24 +686,24 @@ extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
         }
         float inv_rms = rsqrtf(sdata[0] / (float)d + eps);
         for (int j = tid; j < d; j += bs) {
-            float x_val_j = __half2float(src[j]) * inv_rms * __half2float(qn_w[j]);
+            float x_val_j = __bfloat162float(src[j]) * inv_rms * __bfloat162float(qn_w[j]);
             int pj = (j < half_) ? (j + half_) : (j - half_);
-            float x_pair = __half2float(src[pj]) * inv_rms * __half2float(qn_w[pj]);
+            float x_pair = __bfloat162float(src[pj]) * inv_rms * __bfloat162float(qn_w[pj]);
             float pair_val = (j < half_) ? -x_pair : x_pair;
-            float c = __half2float(cos[cs_row * d + j]);
-            float si = __half2float(sin[cs_row * d + j]);
-            dst[j] = __float2half(x_val_j * c + pair_val * si);
+            float c = __bfloat162float(cos[cs_row * d + j]);
+            float si = __bfloat162float(sin[cs_row * d + j]);
+            dst[j] = __float2bfloat16(x_val_j * c + pair_val * si);
         }
     } else {
         // K+V path
         int ih = hy - nqh;
         if (ih >= nkvh) return;
-        const __half* k_src = qkv + (ib * s + is) * total_cols + q_dim + ih * d;
-        const __half* v_src = qkv + (ib * s + is) * total_cols + q_dim + kv_dim + ih * d;
+        const __nv_bfloat16* k_src = qkv + (ib * s + is) * total_cols + q_dim + ih * d;
+        const __nv_bfloat16* v_src = qkv + (ib * s + is) * total_cols + q_dim + kv_dim + ih * d;
         int cache_idx = ((ib * nkvh + ih) * max_seq + (start + is)) * d;
         float local = 0.0f;
         for (int j = tid; j < d; j += bs) {
-            float v = __half2float(k_src[j]);
+            float v = __bfloat162float(k_src[j]);
             local += v * v;
         }
         sdata[tid] = local;
@@ -714,13 +714,13 @@ extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
         }
         float inv_rms = rsqrtf(sdata[0] / (float)d + eps);
         for (int j = tid; j < d; j += bs) {
-            float k_val_j = __half2float(k_src[j]) * inv_rms * __half2float(kn_w[j]);
+            float k_val_j = __bfloat162float(k_src[j]) * inv_rms * __bfloat162float(kn_w[j]);
             int pj = (j < half_) ? (j + half_) : (j - half_);
-            float k_pair = __half2float(k_src[pj]) * inv_rms * __half2float(kn_w[pj]);
+            float k_pair = __bfloat162float(k_src[pj]) * inv_rms * __bfloat162float(kn_w[pj]);
             float pair_val = (j < half_) ? -k_pair : k_pair;
-            float c = __half2float(cos[cs_row * d + j]);
-            float si = __half2float(sin[cs_row * d + j]);
-            k_cache[cache_idx + j] = __float2half(k_val_j * c + pair_val * si);
+            float c = __bfloat162float(cos[cs_row * d + j]);
+            float si = __bfloat162float(sin[cs_row * d + j]);
+            k_cache[cache_idx + j] = __float2bfloat16(k_val_j * c + pair_val * si);
             v_cache[cache_idx + j] = v_src[j];
         }
     }
@@ -730,13 +730,13 @@ extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
 // qkv [b, s, total_cols]; K at cols [q_dim..q_dim+kv_dim), V at [q_dim+kv_dim..q_dim+2*kv_dim).
 // Writes k_cache [b, nkvh, max_seq, d] and v_cache [b, nkvh, max_seq, d] at rows [start..start+s).
 // Grid = (b*nkvh*s,) one block per (kv_head, seq) row.
-extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
-    __half* __restrict__ k_cache,
-    __half* __restrict__ v_cache,
-    const __half* __restrict__ qkv,
-    const __half* __restrict__ kn_w,
-    const __half* __restrict__ cos,
-    const __half* __restrict__ sin,
+extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_bf16(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ kn_w,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
     int b, int nkvh, int s, int d, int total_cols,
     int q_dim, int kv_dim, int max_seq, int start, int pos_offset, float eps
 ) {
@@ -750,8 +750,8 @@ extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
     int ib = row / (s * nkvh);
     int cs_row = pos_offset + is;
 
-    const __half* k_src = qkv + (ib * s + is) * total_cols + q_dim + ih * d;
-    const __half* v_src = qkv + (ib * s + is) * total_cols + q_dim + kv_dim + ih * d;
+    const __nv_bfloat16* k_src = qkv + (ib * s + is) * total_cols + q_dim + ih * d;
+    const __nv_bfloat16* v_src = qkv + (ib * s + is) * total_cols + q_dim + kv_dim + ih * d;
     int cache_idx = ((ib * nkvh + ih) * max_seq + (start + is)) * d;
 
     extern __shared__ float sdata[];
@@ -759,7 +759,7 @@ extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
     // K: sum of squares (norm), then rotary + cache write
     float local = 0.0f;
     for (int j = tid; j < d; j += bs) {
-        float v = __half2float(k_src[j]);
+        float v = __bfloat162float(k_src[j]);
         local += v * v;
     }
     sdata[tid] = local;
@@ -772,13 +772,13 @@ extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
 
     int half_ = d >> 1;
     for (int j = tid; j < d; j += bs) {
-        float k_val_j  = __half2float(k_src[j])  * inv_rms * __half2float(kn_w[j]);
+        float k_val_j  = __bfloat162float(k_src[j])  * inv_rms * __bfloat162float(kn_w[j]);
         int pj = (j < half_) ? (j + half_) : (j - half_);
-        float k_pair   = __half2float(k_src[pj]) * inv_rms * __half2float(kn_w[pj]);
+        float k_pair   = __bfloat162float(k_src[pj]) * inv_rms * __bfloat162float(kn_w[pj]);
         float pair_val = (j < half_) ? -k_pair : k_pair;
-        float c = __half2float(cos[cs_row * d + j]);
-        float si = __half2float(sin[cs_row * d + j]);
-        k_cache[cache_idx + j] = __float2half(k_val_j * c + pair_val * si);
+        float c = __bfloat162float(cos[cs_row * d + j]);
+        float si = __bfloat162float(sin[cs_row * d + j]);
+        k_cache[cache_idx + j] = __float2bfloat16(k_val_j * c + pair_val * si);
         // V: direct copy (no norm, no rotary).
         v_cache[cache_idx + j] = v_src[j];
     }
@@ -786,9 +786,9 @@ extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
 
 // ─── KV cache write ───────────────────────────────────────────────
 // k_new [b, nkvh, s_new, d] (contig) → cache [b, nkvh, max_seq, d] at rows [start..start+s_new).
-extern "C" __global__ void kv_cache_write_f16(
-    __half* __restrict__ cache,
-    const __half* __restrict__ k_new,
+extern "C" __global__ void kv_cache_write_bf16(
+    __nv_bfloat16* __restrict__ cache,
+    const __nv_bfloat16* __restrict__ k_new,
     int b, int nkvh, int max_seq, int d,
     int start, int s_new
 ) {
@@ -804,11 +804,11 @@ extern "C" __global__ void kv_cache_write_f16(
 }
 
 // ─── Fused KV cache write (K + V in one launch) ───────────────────
-extern "C" __global__ void kv_cache_write_pair_f16(
-    __half* __restrict__ k_cache,
-    __half* __restrict__ v_cache,
-    const __half* __restrict__ k_new,
-    const __half* __restrict__ v_new,
+extern "C" __global__ void kv_cache_write_pair_bf16(
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ k_new,
+    const __nv_bfloat16* __restrict__ v_new,
     int b, int nkvh, int max_seq, int d,
     int start, int s_new
 ) {
@@ -826,37 +826,37 @@ extern "C" __global__ void kv_cache_write_pair_f16(
 
 // ─── Element-wise GELU (audio encoder activation) ─────────────────
 // Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
-extern "C" __global__ void gelu_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
+extern "C" __global__ void gelu_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float v = __half2float(x[i]);
+    float v = __bfloat162float(x[i]);
     float g = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
-    out[i] = __float2half(g);
+    out[i] = __float2bfloat16(g);
 }
 
 // ─── In-place GELU ─────────────────────────────────────────────────
-extern "C" __global__ void gelu_inplace_f16(
-    __half* __restrict__ x,
+extern "C" __global__ void gelu_inplace_bf16(
+    __nv_bfloat16* __restrict__ x,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float v = __half2float(x[i]);
+    float v = __bfloat162float(x[i]);
     float g = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
-    x[i] = __float2half(g);
+    x[i] = __float2bfloat16(g);
 }
 
 // ─── LayerNorm (with bias) ─────────────────────────────────────────
 // x [outer, last] * weight[last] + bias[last]; mean/var per row.
-extern "C" __global__ void layer_norm_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ x,
-    const __half* __restrict__ w,
-    const __half* __restrict__ bias,
+extern "C" __global__ void layer_norm_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ bias,
     int last,
     int outer,
     float eps
@@ -870,7 +870,7 @@ extern "C" __global__ void layer_norm_f16(
     // Sum and sum of squares
     float l_sum = 0.0f, l_sq = 0.0f;
     for (int j = tid; j < last; j += bs) {
-        float v = __half2float(x[row * last + j]);
+        float v = __bfloat162float(x[row * last + j]);
         l_sum += v;
         l_sq  += v * v;
     }
@@ -889,22 +889,22 @@ extern "C" __global__ void layer_norm_f16(
     float inv_std = rsqrtf(var + eps);
 
     for (int j = tid; j < last; j += bs) {
-        float v = (__half2float(x[row * last + j]) - mean) * inv_std;
-        out[row * last + j] = __float2half(v * __half2float(w[j]) + __half2float(bias[j]));
+        float v = (__bfloat162float(x[row * last + j]) - mean) * inv_std;
+        out[row * last + j] = __float2bfloat16(v * __bfloat162float(w[j]) + __bfloat162float(bias[j]));
     }
 }
 
 // ─── Add bias broadcast (for Linear with bias) ─────────────────────
 // x [outer, last] += bias[last]
-extern "C" __global__ void add_bias_inplace_f16(
-    __half* __restrict__ x,
-    const __half* __restrict__ bias,
+extern "C" __global__ void add_bias_inplace_bf16(
+    __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ bias,
     int outer, int last
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
     if (tot >= outer * last) return;
     int j = tot % last;
-    x[tot] = __float2half(__half2float(x[tot]) + __half2float(bias[j]));
+    x[tot] = __float2bfloat16(__bfloat162float(x[tot]) + __bfloat162float(bias[j]));
 }
 
 // ─── Fused GQA attention (decode-only: s_q = 1) ────────────────────
@@ -919,11 +919,11 @@ extern "C" __global__ void add_bias_inplace_f16(
 //
 // Required shared mem: cur_len * sizeof(float) + d * sizeof(float).
 #define MAX_SEQ_FUSED 4096
-extern "C" __global__ void fused_gqa_decode_f16(
-    __half* __restrict__ out,           // [b, nqh, 1, d]
-    const __half* __restrict__ q,       // [b, nqh, 1, d]
-    const __half* __restrict__ k_cache, // [b, nkvh, max_seq, d]
-    const __half* __restrict__ v_cache, // [b, nkvh, max_seq, d]
+extern "C" __global__ void fused_gqa_decode_bf16(
+    __nv_bfloat16* __restrict__ out,           // [b, nqh, 1, d]
+    const __nv_bfloat16* __restrict__ q,       // [b, nqh, 1, d]
+    const __nv_bfloat16* __restrict__ k_cache, // [b, nkvh, max_seq, d]
+    const __nv_bfloat16* __restrict__ v_cache, // [b, nkvh, max_seq, d]
     int b, int nqh, int nkvh, int max_seq, int d, int cur_len, float scale
 ) {
     int qh_global = blockIdx.x;
@@ -936,16 +936,16 @@ extern "C" __global__ void fused_gqa_decode_f16(
     extern __shared__ float smem[];   // scores[cur_len], then partial_out[d * t_chunks]
     float* partial = smem + cur_len;
 
-    const __half* q_row  = q       + (ib * nqh  + qh) * d;
-    const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d;
-    const __half* v_base = v_cache + (ib * nkvh + kh) * max_seq * d;
-    __half* out_row = out + (ib * nqh + qh) * d;
+    const __nv_bfloat16* q_row  = q       + (ib * nqh  + qh) * d;
+    const __nv_bfloat16* k_base = k_cache + (ib * nkvh + kh) * max_seq * d;
+    const __nv_bfloat16* v_base = v_cache + (ib * nkvh + kh) * max_seq * d;
+    __nv_bfloat16* out_row = out + (ib * nqh + qh) * d;
 
     // --- Stage 1: scores[t] = (Q · K[t]) * scale ---
     for (int t = tid; t < cur_len; t += bs) {
         float dot = 0.0f;
         for (int j = 0; j < d; j++) {
-            dot += __half2float(q_row[j]) * __half2float(k_base[t * d + j]);
+            dot += __bfloat162float(q_row[j]) * __bfloat162float(k_base[t * d + j]);
         }
         smem[t] = dot * scale;
     }
@@ -990,7 +990,7 @@ extern "C" __global__ void fused_gqa_decode_f16(
     if (j_idx < d && t_idx < t_chunks) {
         float acc = 0.0f;
         for (int t = t_idx; t < cur_len; t += t_chunks) {
-            acc += smem[t] * __half2float(v_base[t * d + j_idx]);
+            acc += smem[t] * __bfloat162float(v_base[t * d + j_idx]);
         }
         partial[t_idx * d + j_idx] = acc;
     }
@@ -1000,13 +1000,13 @@ extern "C" __global__ void fused_gqa_decode_f16(
         for (int ti = 0; ti < t_chunks; ti++) {
             acc += partial[ti * d + tid];
         }
-        out_row[tid] = __float2half(acc * inv_sum);
+        out_row[tid] = __float2bfloat16(acc * inv_sum);
     }
 }
 
 // ─── Split-K fused GQA decode (for long context) ───────────────────
 // 2-kernel flash-attention style.  Used when cur_len is large enough that single-block
-// fused_gqa_decode_f16 becomes the bottleneck.
+// fused_gqa_decode_bf16 becomes the bottleneck.
 //
 // Phase 1: each block handles one (b, nqh, t_chunk) — computes partial scores for its
 // chunk, then partial numerator (sum of exp(scores) * V) and partial max + sum_exp.
@@ -1015,13 +1015,13 @@ extern "C" __global__ void fused_gqa_decode_f16(
 // Phase 2: each block handles one (b, nqh) — reads N chunks of (max, sum, partial_out),
 // merges with online-softmax correction, writes final out.
 
-extern "C" __global__ void fused_gqa_decode_split_p1_f16(
+extern "C" __global__ void fused_gqa_decode_split_p1_bf16(
     float* __restrict__ part_out,       // [b, nqh, NCHUNKS, d]   (float for accumulation)
     float* __restrict__ part_max,       // [b, nqh, NCHUNKS]
     float* __restrict__ part_sum,       // [b, nqh, NCHUNKS]
-    const __half* __restrict__ q,       // [b, nqh, d]
-    const __half* __restrict__ k_cache, // [b, nkvh, max_seq, d]
-    const __half* __restrict__ v_cache, // [b, nkvh, max_seq, d]
+    const __nv_bfloat16* __restrict__ q,       // [b, nqh, d]
+    const __nv_bfloat16* __restrict__ k_cache, // [b, nkvh, max_seq, d]
+    const __nv_bfloat16* __restrict__ v_cache, // [b, nkvh, max_seq, d]
     int b, int nqh, int nkvh, int max_seq, int d,
     int cur_len, int chunk_size, int n_chunks, float scale
 ) {
@@ -1047,15 +1047,15 @@ extern "C" __global__ void fused_gqa_decode_split_p1_f16(
 
     extern __shared__ float smem[];   // scores[chunk_size]
 
-    const __half* q_row  = q       + (ib * nqh  + qh) * d;
-    const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
-    const __half* v_base = v_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
+    const __nv_bfloat16* q_row  = q       + (ib * nqh  + qh) * d;
+    const __nv_bfloat16* k_base = k_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
+    const __nv_bfloat16* v_base = v_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
 
     // Stage 1: scores
     for (int t = tid; t < chunk_len; t += bs) {
         float dot = 0.0f;
         for (int j = 0; j < d; j++) {
-            dot += __half2float(q_row[j]) * __half2float(k_base[t * d + j]);
+            dot += __bfloat162float(q_row[j]) * __bfloat162float(k_base[t * d + j]);
         }
         smem[t] = dot * scale;
     }
@@ -1101,7 +1101,7 @@ extern "C" __global__ void fused_gqa_decode_split_p1_f16(
     if (j_idx < d && t_idx < t_split) {
         float acc = 0.0f;
         for (int t = t_idx; t < chunk_len; t += t_split) {
-            acc += smem[t] * __half2float(v_base[t * d + j_idx]);
+            acc += smem[t] * __bfloat162float(v_base[t * d + j_idx]);
         }
         partial[t_idx * d + j_idx] = acc;
     }
@@ -1123,8 +1123,8 @@ extern "C" __global__ void fused_gqa_decode_split_p1_f16(
 
 // Phase 2: merge chunks via online softmax correction.
 // Grid = (b * nqh,), block_dim = d.
-extern "C" __global__ void fused_gqa_decode_split_p2_f16(
-    __half* __restrict__ out,           // [b, nqh, d]
+extern "C" __global__ void fused_gqa_decode_split_p2_bf16(
+    __nv_bfloat16* __restrict__ out,           // [b, nqh, d]
     const float* __restrict__ part_out, // [b, nqh, n_chunks, d]
     const float* __restrict__ part_max, // [b, nqh, n_chunks]
     const float* __restrict__ part_sum, // [b, nqh, n_chunks]
@@ -1160,15 +1160,15 @@ extern "C" __global__ void fused_gqa_decode_split_p2_f16(
                 acc += w * part_out[((ib * nqh + qh) * n_chunks + c) * d + tid];
             }
         }
-        out[(ib * nqh + qh) * d + tid] = __float2half(acc);
+        out[(ib * nqh + qh) * d + tid] = __float2bfloat16(acc);
     }
 }
 
 // ─── Slice along dim 2 of [b, h, s, d] ─────────────────────────────
 // out [b, h, len, d] = src[..., start:start+len, ...]
-extern "C" __global__ void slice_dim2_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ src,
+extern "C" __global__ void slice_dim2_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ src,
     int b, int h, int s, int d, int start, int len
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1183,9 +1183,9 @@ extern "C" __global__ void slice_dim2_f16(
 }
 
 // ─── Concat along dim 2: write a chunk [b, h, len, d] into dst [b, h, s, d] at offset ──
-extern "C" __global__ void concat_dim2_write_f16(
-    __half* __restrict__ dst,
-    const __half* __restrict__ src,
+extern "C" __global__ void concat_dim2_write_bf16(
+    __nv_bfloat16* __restrict__ dst,
+    const __nv_bfloat16* __restrict__ src,
     int b, int h, int s, int d, int dst_offset, int len
 ) {
     int tot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1204,9 +1204,9 @@ extern "C" __global__ void concat_dim2_write_f16(
 // out    [b * h_out * w_out, c_in * 3 * 3]   row-major
 //   where h_out = (h + 2 - 3) / 2 + 1, w_out similarly
 // One thread per output element across the full unfolded matrix.
-extern "C" __global__ void im2col_3x3_s2p1_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ in,
+extern "C" __global__ void im2col_3x3_s2p1_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
     int b, int c_in, int h, int w, int h_out, int w_out
 ) {
     int total = b * h_out * w_out * c_in * 9;
@@ -1224,9 +1224,9 @@ extern "C" __global__ void im2col_3x3_s2p1_f16(
     int kx = kk % 3;
     int in_y = ih * 2 + ky - 1;
     int in_x = iw * 2 + kx - 1;
-    __half v;
+    __nv_bfloat16 v;
     if (in_y < 0 || in_y >= h || in_x < 0 || in_x >= w) {
-        v = __float2half(0.0f);
+        v = __float2bfloat16(0.0f);
     } else {
         int in_idx = ((ib * c_in + ci) * h + in_y) * w + in_x;
         v = in[in_idx];
@@ -1237,10 +1237,10 @@ extern "C" __global__ void im2col_3x3_s2p1_f16(
 // ─── Fused GELU + bias add + reshape from GEMM output to [b, c_out, h_out, w_out] ──
 // gemm_out [b * h_out * w_out, c_out] (row-major, no bias) → conv_out [b, c_out, h_out, w_out]
 // with bias[c_out] added and GELU applied.
-extern "C" __global__ void conv_postprocess_f16(
-    __half* __restrict__ out,
-    const __half* __restrict__ gemm_out,
-    const __half* __restrict__ bias,
+extern "C" __global__ void conv_postprocess_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gemm_out,
+    const __nv_bfloat16* __restrict__ bias,
     int b, int c_out, int h_out, int w_out
 ) {
     int total = b * c_out * h_out * w_out;
@@ -1251,10 +1251,10 @@ extern "C" __global__ void conv_postprocess_f16(
     int co = (tot / (w_out * h_out)) % c_out;
     int ib = tot / (w_out * h_out * c_out);
     int gemm_idx = ((ib * h_out + ih) * w_out + iw) * c_out + co;
-    float v = __half2float(gemm_out[gemm_idx]) + __half2float(bias[co]);
+    float v = __bfloat162float(gemm_out[gemm_idx]) + __bfloat162float(bias[co]);
     // GELU
     float g = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
-    out[tot] = __float2half(g);
+    out[tot] = __float2bfloat16(g);
 }
 
 
@@ -1266,9 +1266,9 @@ extern "C" __global__ void conv_postprocess_f16(
 // audio   [n_audio, hidden]   — source rows
 // positions [n_audio] i32     — destination row indices in embeds
 // Each block handles one audio row, threads cooperate over hidden.
-extern "C" __global__ void scatter_audio_rows_f16(
-    __half* __restrict__ embeds,
-    const __half* __restrict__ audio,
+extern "C" __global__ void scatter_audio_rows_bf16(
+    __nv_bfloat16* __restrict__ embeds,
+    const __nv_bfloat16* __restrict__ audio,
     const int* __restrict__ positions,
     int n_audio, int hidden
 ) {
@@ -1277,8 +1277,8 @@ extern "C" __global__ void scatter_audio_rows_f16(
     int tid = threadIdx.x;
     int bs = blockDim.x;
     int dst = positions[row];
-    const __half* src = audio + row * hidden;
-    __half* dst_ptr = embeds + dst * hidden;
+    const __nv_bfloat16* src = audio + row * hidden;
+    __nv_bfloat16* dst_ptr = embeds + dst * hidden;
     for (int j = tid; j < hidden; j += bs) {
         dst_ptr[j] = src[j];
     }
