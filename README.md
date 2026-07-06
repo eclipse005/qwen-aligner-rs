@@ -69,6 +69,27 @@ cargo run --release -- --model path/to/model --audio audio.wav --text "transcrip
 | `cuda`（默认） | CUDA 后端，需要 CUDA 12.8+ |
 | `cpu`（默认） | CPU 后端 |
 
+## 性能
+
+测试环境：NVIDIA P104-100 8 GiB，CUDA 12.8，模型 `models/Qwen3-ForcedAligner-0.6B`。
+
+与上游 Python `qwen_asr` 强制对齐器对比（典型 15 s ~ 4 min 音频片段）：
+
+| 时长 | tokens | Rust 时间 | Python 时间 | Rust 显存 | Python 显存 | 时间戳偏差 |
+|------|--------|-----------|-------------|-----------|-------------|------------|
+| 15 s | 40 | 4.7 s | 14.9 s | ~2.0 GB | ~2.1 GB | 16 ms |
+| ~90 s | 200 | 6.2 s | 15.8 s | ~3.1 GB | ~2.9 GB | 16 ms |
+| ~3 min | 600 | 10.9 s | 21.8 s | ~4.6 GB | ~5.8 GB | <1 ms |
+| ~3 min | 900 | 11.8 s | 22.9 s | ~5.1 GB | ~6.8 GB | <1 ms |
+| ~4 min | 190 | 11.5 s | 22.0 s | ~5.3 GB | ~6.6 GB | <1 ms |
+
+说明：
+
+- 测试数据为本地私有音频/文本片段，不在仓库中。
+- Python 使用 `torch.bfloat16`，Rust 使用 f16 CUDA kernel + f32 累加；两者 token 数完全一致，时间戳偏差在 16 ms 以内。
+- Python 版在单进程内连续跑多个长音频时显存会累积，8 GiB 显卡上后续任务会 OOM；Rust 版不存在此问题。
+- Rust 版当前仅支持 WAV 输入，MP3 或 raw f32le 需先用 ffmpeg 等工具转成 WAV。
+
 ## License
 
 MIT
