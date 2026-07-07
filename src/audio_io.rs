@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use crate::resampler::resample_mono;
+
 const SAMPLE_RATE: u32 = 16_000;
 
 pub(crate) fn load_wav_mono_16k(path: &Path) -> Result<Vec<f32>> {
@@ -43,11 +45,7 @@ pub(crate) fn load_wav_mono_16k(path: &Path) -> Result<Vec<f32>> {
     if spec.sample_rate == SAMPLE_RATE {
         return Ok(samples);
     }
-    // TODO: replace with libsoxr-rs (pure-Rust port of libsoxr) to match
-    // librosa's soxr_hq numerically. This linear-interpolation path lacks
-    // anti-aliasing and is the sole remaining source of divergence from the
-    // Python reference. See docs/ALIGNMENT_HANDOFF.md for the full diagnosis.
-    Ok(resample_linear(&samples, spec.sample_rate, SAMPLE_RATE))
+    Ok(resample_mono(&samples, spec.sample_rate, SAMPLE_RATE))
 }
 
 fn downmix_channels(samples: &[f32], channels: usize) -> Vec<f32> {
@@ -89,24 +87,3 @@ fn floor_div(value: i64, divisor: i64) -> i64 {
     }
 }
 
-fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if source_rate == target_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    if source_rate.is_multiple_of(target_rate) {
-        let step = (source_rate / target_rate) as usize;
-        return samples.iter().step_by(step).copied().collect();
-    }
-    let target_len = ((samples.len() as u64 * target_rate as u64 + source_rate as u64 / 2)
-        / source_rate as u64) as usize;
-    let ratio = source_rate as f64 / target_rate as f64;
-    let mut output = Vec::with_capacity(target_len);
-    for index in 0..target_len {
-        let pos = index as f64 * ratio;
-        let left = pos.floor() as usize;
-        let right = (left + 1).min(samples.len() - 1);
-        let frac = (pos - left as f64) as f32;
-        output.push(samples[left] * (1.0 - frac) + samples[right] * frac);
-    }
-    output
-}

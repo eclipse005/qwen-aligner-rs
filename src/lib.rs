@@ -8,6 +8,7 @@ pub mod tokenizer;
 pub mod text;
 pub mod prompt;
 pub mod timestamp;
+pub mod resampler;
 mod inference;
 pub mod batch;
 

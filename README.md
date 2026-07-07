@@ -42,6 +42,27 @@ CPU-only 构建：
 qwen-forced-aligner-rs = { git = "https://github.com/eclipse005/qwen-aligner-rs.git", default-features = false, features = ["cpu"] }
 ```
 
+## 音频采样率建议
+
+**最佳实践：输入 16 kHz 单声道 WAV。** 这是 Qwen3-ForcedAligner 模型的原生采样率，16 kHz 输入不经过重采样，与上游 Python `qwen_asr` 的输出完全一致。
+
+其他采样率的处理：
+
+| 输入采样率 | 重采样质量 | 与 Python 一致性 |
+|-----------|-----------|-----------------|
+| **16 kHz** | 无需重采样 | ✅ 完全一致 |
+| 32 / 48 kHz | 整数比抽取（polyphase Kaiser sinc） | ✅ 高精度 |
+| 24 kHz | 有理比抽取（L=2/M=3，Kaiser sinc） | ✅ 高精度 |
+| 44.1 / 22.05 / 96 kHz | Kaiser sinc 插值 | ⚠️ 近似（通带内一致，过渡带有微小差异） |
+
+如果源音频是 44.1 kHz 或其他非标准采样率，建议先用 ffmpeg 预转码到 16 kHz：
+
+```bash
+ffmpeg -i input.flac -ar 16000 -ac 1 -c:a pcm_f32le output.wav
+```
+
+这样能保证对齐效果与原版 Python 完全一致。
+
 ## 使用
 
 ### 作为库

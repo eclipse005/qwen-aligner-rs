@@ -11,7 +11,7 @@
 /bench_outputs/
 bench_*.json
 
-# Test fixtures (audio/text) and any integration tests — local-only.
+# Test fixtures, integration tests, and verification scripts — local-only.
 /tests/
 
 # Temporary benchmark / debug artifacts.
