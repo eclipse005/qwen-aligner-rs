@@ -14,15 +14,14 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream,
     LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use cudarc::nvrtc::Ptx;
 use half::bf16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::TextConfig;
+use crate::prebuilt_ptx;
 pub(crate) use crate::raw_tensor::RawTensor;
-
-const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
 // ═══════════════════════════════════════════════════════════════════════
 //  GpuTensor — owned bf16 tensor on the GPU
@@ -140,18 +139,19 @@ impl CudaState {
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone())?;
 
-        // CUDA toolkit include for cuda_fp16.h
-        let cuda_include = std::env::var("CUDA_PATH")
-            .map(|p| format!("{}/include", p))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        let opts = CompileOptions {
-            arch: None,
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(KERNEL_SRC, opts)
-            .map_err(|e| anyhow::anyhow!("kernel compile failed: {:?}", e))?;
-        let module = ctx.load_module(ptx)?;
+        // Scheme B: load precompiled multi-arch PTX (no runtime NVRTC).
+        let (major, minor) = ctx
+            .compute_capability()
+            .map_err(|e| anyhow::anyhow!("failed to query compute capability: {e:?}"))?;
+        let (ptx_src, selected_sm) = prebuilt_ptx::resolve_ptx_for_device(major, minor)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        log::info!(
+            "loading prebuilt CUDA kernels for device sm_{}{} (selected sm_{})",
+            major,
+            minor,
+            selected_sm
+        );
+        let module = ctx.load_module(Ptx::from_src(ptx_src))?;
 
         let k = CudaKernels {
             rms_norm: module.load_function("rms_norm_bf16")?,

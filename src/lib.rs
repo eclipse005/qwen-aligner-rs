@@ -22,6 +22,8 @@ pub mod backend;
 pub(crate) mod cudarc_engine;
 #[cfg(feature = "cuda")]
 pub(crate) mod gpu_audio_encoder;
+#[cfg(feature = "cuda")]
+pub(crate) mod prebuilt_ptx;
 
 // The CPU engine module.
 #[cfg(feature = "cpu")]
