@@ -1,8 +1,8 @@
 # qwen-aligner-rs
 
-[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 强制对齐器（Forced Aligner）的 Rust 实现。为 ASR 转录文本生成单词/字符级时间戳，支持 CUDA 和 CPU 双后端，零深度学习框架依赖。
+[Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) 的 Rust 实现（官方项目见 [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)）。为 ASR 转录文本生成单词/字符级时间戳，支持 CUDA 和 CPU 双后端，零深度学习框架依赖。
 
-基于 Qwen3-ASR 模型架构，将音频与转录文本对齐，输出每个单词/字符的精确起止时间。
+基于 Qwen 开源的 Forced Aligner 架构与权重，将音频与转录文本对齐，输出每个单词/字符的精确起止时间。
 
 ## 分词器
 
@@ -110,6 +110,28 @@ cargo run --release -- --model path/to/model --audio audio.wav --text "transcrip
 - Python 使用 `torch.bfloat16`，Rust 使用 f16 CUDA kernel + f32 累加；两者 token 数完全一致，时间戳偏差在 16 ms 以内。
 - Python 版在单进程内连续跑多个长音频时显存会累积，8 GiB 显卡上后续任务会 OOM；Rust 版不存在此问题。
 - Rust 版当前仅支持 WAV 输入，MP3 或 raw f32le 需先用 ffmpeg 等工具转成 WAV。
+
+## 模型下载
+
+从 HuggingFace 下载 safetensors 格式权重（版权归原作者）：
+
+- [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B)
+
+官方项目：
+
+- [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)（含 Forced Aligner 说明与 Python 推理）
+
+## 致谢 / 原版出处
+
+本仓库是 **独立的 Rust 推理实现**，用于加载并运行官方 Qwen3-ForcedAligner 权重；**不是** Alibaba / Qwen 官方发行版，与原作者无隶属关系。
+
+| 组件 | 原版 | 链接 | 协议（以官方页面为准） |
+|------|------|------|------------------------|
+| 模型权重 | Qwen3-ForcedAligner-0.6B | [Hugging Face](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | Apache-2.0 |
+| 官方推理与文档 | Qwen3-ASR 仓库 | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Apache-2.0 |
+| 日语分词参考 | Python `nagisa`（本仓库通过 [nagisa-rs](https://github.com/eclipse005/nagisa-rs) 对齐） | — | 见各自上游 |
+
+使用模型权重时请遵守原作者许可证；本仓库的 Rust 推理代码以本仓库 License 为准。
 
 ## License
 
