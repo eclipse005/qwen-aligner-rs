@@ -14,20 +14,8 @@
 | 韩语 | 内置 LR 分词（对应 Python `soynlp.LTokenizer`） | 行为对齐 |
 | 中/英/混合 | 空格 + CJK 单字切分 | 行为对齐 |
 
-日语路径需要 nagisa 模型权重。模型文件随 Qwen 模型目录分发，放在 `<model_dir>/nagisa/`，包含 7 个文件（约 25 MB）：
-
-```
-<model_dir>/nagisa/
-├── hp.json
-├── weights.safetensors
-├── uni2id.json
-├── bi2id.json
-├── word2id.json
-├── pos2id.json
-└── word2postags.json
-```
-
-加载时若未找到 `<model_dir>/nagisa/`，会记一条 `info` 日志，日语对齐不可用，但其它语言不受影响。模型文件本身随整个 `models/` 目录在运行时分发，不进 git。
+日语路径使用 [`nagisa-rs`](https://github.com/eclipse005/nagisa-rs) 的 **`Tagger::embedded()`**：
+约 25 MB 的权重与词表在编译期打进二进制，**不需要** `<model_dir>/nagisa/` 目录，也不必随 Qwen 模型单独下载。
 
 ## 安装
 

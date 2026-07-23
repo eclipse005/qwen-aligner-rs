@@ -51,7 +51,8 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 # Pure-Rust port of nagisa (BiLSTM-CRF Japanese tokenizer). byte-for-byte
 # identical to upstream Python `nagisa`, so JA word boundaries match the
-# reference qwen_asr implementation exactly. Bundled in models/.../nagisa/.
-nagisa_rs = { git = "https://github.com/eclipse005/nagisa-rs.git", branch = "master" }
+# reference qwen_asr implementation exactly. Model is embedded in nagisa_rs
+# (Tagger::embedded) — no external models/.../nagisa/ directory required.
+nagisa_rs = { git = "https://github.com/eclipse005/nagisa-rs.git", rev = "cd7726e78ede8451c72cc0fabfd55d2c4ed62442" }
 log = "0.4"
 env_logger = "0.11"

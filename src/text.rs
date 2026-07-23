@@ -111,7 +111,7 @@ pub fn tokenize_korean(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Japanese tokenization via the bundled nagisa-rs model.
+/// Japanese tokenization via the crate-embedded nagisa-rs model.
 ///
 /// `tagger.tagging(text).words` is byte-for-byte identical to upstream
 /// Python `nagisa.tagging(text).words` (the same call the reference
@@ -132,7 +132,8 @@ fn tokenize_japanese(tagger: &nagisa_rs::Tagger, text: &str) -> Vec<String> {
 /// side-channel `words` list used to parse timestamp output.
 ///
 /// `tagger` is required only for the Japanese path; other languages ignore
-/// it and the caller may pass `None`.
+/// it and the caller may pass `None`. The aligner always loads
+/// `Tagger::embedded()` so Japanese never depends on an on-disk model dir.
 pub fn encode_timestamp(
     tagger: Option<&nagisa_rs::Tagger>,
     text: &str,
@@ -140,8 +141,10 @@ pub fn encode_timestamp(
 ) -> Result<(Vec<String>, String)> {
     let lang = language.to_lowercase();
     let words = if lang == "japanese" {
-        let t = tagger.context("Japanese alignment requires the nagisa model (models/.../nagisa/); \
-                                 this directory was not found at load time")?;
+        let t = tagger.context(
+            "Japanese alignment requires a nagisa tagger; \
+             load via nagisa_rs::Tagger::embedded() (no external model dir)",
+        )?;
         tokenize_japanese(t, text)
     } else if lang == "korean" {
         tokenize_korean(text)
@@ -161,15 +164,8 @@ pub fn encode_timestamp(
 mod tests {
     use super::*;
 
-    fn nagisa_model_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models")
-            .join("Qwen3-ForcedAligner-0.6B")
-            .join("nagisa")
-    }
-
     fn tagger() -> nagisa_rs::Tagger {
-        nagisa_rs::Tagger::new(nagisa_model_dir()).expect("load nagisa model")
+        nagisa_rs::Tagger::embedded().expect("load embedded nagisa model")
     }
 
     #[test]

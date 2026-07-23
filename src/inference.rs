@@ -110,10 +110,9 @@ pub fn release_model(model: Qwen3ForcedAligner) {
 pub struct Qwen3ForcedAligner {
     config: AlignerConfig,
     tokenizer: crate::tokenizer::QwenTokenizer,
-    /// Japanese word-segmentation model. Loaded from `<model_dir>/nagisa/`
-    /// if present; `None` only disables the Japanese path, leaving English /
-    /// Korean alignment unaffected.
-    tagger: Option<nagisa_rs::Tagger>,
+    /// Japanese word-segmentation model (nagisa). Compiled into `nagisa_rs`
+    /// via `Tagger::embedded()` — no external `models/.../nagisa/` directory.
+    tagger: nagisa_rs::Tagger,
     engine: Engine,
 }
 
@@ -154,32 +153,10 @@ impl Qwen3ForcedAligner {
         info!("Loading tokenizer...");
         let tokenizer = crate::tokenizer::load_qwen_tokenizer(model_dir)?;
 
-        // Japanese word-segmentation model. Optional: only the Japanese path
-        // depends on it; English / Korean alignment work without it.
-        let nagisa_dir = model_dir.join("nagisa");
-        let tagger = if nagisa_dir.is_dir() {
-            match nagisa_rs::Tagger::new(&nagisa_dir) {
-                Ok(t) => {
-                    info!("Loaded nagisa Japanese tokenizer from {}", nagisa_dir.display());
-                    Some(t)
-                }
-                Err(err) => {
-                    info!(
-                        "nagisa model directory found at {} but failed to load ({}); \
-                         Japanese alignment will be unavailable",
-                        nagisa_dir.display(), err
-                    );
-                    None
-                }
-            }
-        } else {
-            info!(
-                "nagisa model directory not found at {}; Japanese alignment will be \
-                 unavailable (other languages are unaffected)",
-                nagisa_dir.display()
-            );
-            None
-        };
+        // Japanese word-segmentation: crate-embedded nagisa model (~25 MB).
+        // No external `<model_dir>/nagisa/` tree is required.
+        info!("Loading embedded nagisa Japanese tokenizer...");
+        let tagger = nagisa_rs::Tagger::embedded().context("load embedded nagisa model")?;
 
         let resolved = options.device.resolve()?;
         let engine = build_engine(resolved, &config, &weight_data)?;
@@ -394,7 +371,7 @@ impl Qwen3ForcedAligner {
     /// timestamp positions, chunk calculation, mel packing.
     fn prepare_input(&self, waveform: &[f32], text: &str, language: &str) -> anyhow::Result<PreparedInput> {
         // 1. Text tokenization
-        let (words, aligner_input) = crate::text::encode_timestamp(self.tagger.as_ref(), text, language)?;
+        let (words, aligner_input) = crate::text::encode_timestamp(Some(&self.tagger), text, language)?;
         // 2. Mel feature extraction
         let features = extract_log_mel_features(waveform)?;
         // 3. Audio pad expansion

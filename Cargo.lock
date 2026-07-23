@@ -792,7 +792,7 @@ dependencies = [
 [[package]]
 name = "nagisa_rs"
 version = "0.1.0"
-source = "git+https://github.com/eclipse005/nagisa-rs.git?branch=master#57d5f5fa1897ea40ee55f509cd3c36f149f9d23a"
+source = "git+https://github.com/eclipse005/nagisa-rs.git?rev=cd7726e78ede8451c72cc0fabfd55d2c4ed62442#cd7726e78ede8451c72cc0fabfd55d2c4ed62442"
 dependencies = [
  "anyhow",
  "ndarray",
